@@ -7,7 +7,7 @@ app.use(express.json());
 // === ПЕРЕМЕННЫЕ ===
 const INTERCOM_TOKEN = process.env.INTERCOM_TOKEN;
 const LIST_URL = process.env.LIST_URL;
-const CUSTOM_ATTR_NAME = process.env.CUSTOM_ATTR_NAME || 'Unpaid Custom'; // ← ТВОЁ ИМЯ
+const CUSTOM_ATTR_NAME = process.env.CUSTOM_ATTR_NAME || 'Unpaid Custom';
 
 if (!INTERCOM_TOKEN || !LIST_URL) {
   console.error('ОШИБКА: INTERCOM_TOKEN или LIST_URL не заданы!');
@@ -15,22 +15,25 @@ if (!INTERCOM_TOKEN || !LIST_URL) {
 }
 
 // === ФОНОВАЯ ПРОВЕРКА ===
-async function validateAndSetCustom(email) {
-  if (!email || !email.includes('@')) return;
+async function validateAndSetCustom(contactId, email, purchaseEmail) {
+  const emailsToCheck = [email, purchaseEmail].filter(e => e && e.includes('@'));
+  if (emailsToCheck.length === 0) return;
 
   try {
-    console.log(`[ФОН] Проверка: ${email}`);
+    console.log(`[ФОН] Проверка для ID ${contactId}: ${emailsToCheck.join(', ')}`);
     const { data: emailList } = await axios.get(LIST_URL, { timeout: 3000 });
     if (!Array.isArray(emailList)) return;
 
-    const isMatch = emailList.some(e =>
-      typeof e === 'string' && e.trim().toLowerCase() === email.trim().toLowerCase()
+    const isMatch = emailsToCheck.some(e => 
+      emailList.some(listEmail =>
+        typeof listEmail === 'string' && listEmail.trim().toLowerCase() === e.trim().toLowerCase()
+      )
     );
 
     if (isMatch) {
-      const payload = { email, custom_attributes: { [CUSTOM_ATTR_NAME]: true } };
+      const payload = { custom_attributes: { [CUSTOM_ATTR_NAME]: true } };
       try {
-        await axios.post('https://api.intercom.io/contacts', payload, {
+        const response = await axios.put(`https://api.intercom.io/contacts/${contactId}`, payload, {
           headers: {
             'Authorization': `Bearer ${INTERCOM_TOKEN}`,
             'Content-Type': 'application/json',
@@ -38,15 +41,15 @@ async function validateAndSetCustom(email) {
           },
           timeout: 4000
         });
-        console.log(`[ФОН] ${CUSTOM_ATTR_NAME} = true для ${email}`);
-      } catch (e) {
-        if (e.response?.status === 409) {
-          console.log(`[ФОН] 409 OK — уже установлено`);
-        }
+        console.log(`[ФОН] ${CUSTOM_ATTR_NAME} = true (Status: ${response.status})`);
+      } catch (apiError) {
+        console.error(`[ФОН] Полная ошибка API для ${contactId}: Status ${apiError.response?.status}, Data:`, apiError.response?.data || apiError.message);
       }
+    } else {
+      console.log(`[ФОН] Нет совпадения для ${contactId}`);
     }
   } catch (e) {
-    console.error('[ФОН] Ошибка:', e.message);
+    console.error('[ФОН] Критическая ошибка:', e.message);
   }
 }
 
@@ -60,36 +63,62 @@ app.post('/validate-email', async (req, res) => {
     return res.status(200).json({ message: "Webhook test received" });
   }
 
-  // === 2. ТОЛЬКО conversation.user.replied ===
-  if (req.body.topic !== 'conversation.user.replied') {
-    console.log(`Пропущен topic: ${req.body.topic}`);
-    return res.status(200).json({ skipped: true, reason: 'wrong_topic' });
+  // === 2. ИЗВЛЕЧЕНИЕ ===
+  const item = req.body.data?.item;
+  if (!item) {
+    console.log('Нет data.item');
+    return res.status(400).json({ error: 'Invalid payload' });
   }
 
-  // === 3. ИЗВЛЕЧЕНИЕ КОНТАКТА ===
-  const contact = req.body.data?.item?.contacts?.contacts?.[0];
-  if (!contact) {
-    console.log('Контакт не найден');
-    return res.status(400).json({ error: 'No contact' });
+  const author = item.author;
+  const contactId = item.contacts?.contacts?.[0]?.id || author.id; // ID из контакта или author
+
+  if (!contactId) {
+    console.log('Нет contact ID');
+    return res.status(400).json({ error: 'No contact ID' });
   }
 
-  // === 4. ПОЛУЧАЕМ ОБА EMAIL ===
-  const email = contact.email;
-  const purchaseEmail = contact.custom_attributes?.['Purchase email']; // ← ТОЧНОЕ ИМЯ!
+  // === 3. ФИЛЬТР БОТОВ ===
+  if (
+    author?.type === 'bot' ||
+    author?.from_ai_agent === true ||
+    author?.is_ai_answer === true ||
+    author?.email?.includes('operator+') ||
+    author?.email?.includes('@intercom.io')
+  ) {
+    console.log(`Бот пропущен: ${author?.name} (${author?.email})`);
+    return res.status(200).json({ skipped: true, reason: 'bot_message' });
+  }
 
-  const emailsToCheck = [email, purchaseEmail].filter(e => e && e.includes('@'));
-  if (emailsToCheck.length === 0) {
-    console.log('Нет email');
+  // === 4. ПОЛУЧАЕМ EMAIL (из author для user.replied) ===
+  const email = author.email;
+
+  if (!email || !email.includes('@')) {
+    console.log('Нет email в author');
     return res.status(400).json({ error: 'No email' });
   }
 
-  console.log(`Обрабатываем: ${emailsToCheck.join(', ')}`);
+  // === 5. ПОЛУЧАЕМ PURCHASE EMAIL (API-вызов по ID) ===
+  let purchaseEmail = null;
+  try {
+    const contactResponse = await axios.get(`https://api.intercom.io/contacts/${contactId}`, {
+      headers: {
+        'Authorization': `Bearer ${INTERCOM_TOKEN}`,
+        'Accept': 'application/json'
+      },
+      timeout: 3000
+    });
+    purchaseEmail = contactResponse.data.custom_attributes?.['Purchase email'];
+    console.log(`[API] Purchase email для ${contactId}: ${purchaseEmail}`);
+  } catch (e) {
+    console.error('[API] Ошибка получения контакта:', e.response?.status || e.message);
+  }
 
-  // === 5. ОТВЕЧАЕМ СРАЗУ ===
-  res.status(200).json({ received: true, emails: emailsToCheck });
+  // === 6. ОТВЕЧАЕМ СРАЗУ ===
+  res.status(200).json({ received: true, email, purchaseEmail, contactId });
 
-  // === 6. ФОНОВАЯ ПРОВЕРКА ===
-  emailsToCheck.forEach(email => validateAndSetCustom(email));
+  // === 7. ФОНОВАЯ ПРОВЕРКА ===
+  validateAndSetCustom(contactId, email, purchaseEmail);
 });
 
 // === HEAD ===
@@ -100,5 +129,4 @@ app.head('/validate-email', (req, res) => {
 // === ЗАПУСК ===
 app.listen(process.env.PORT, () => {
   console.log(`Сервер запущен на порту ${process.env.PORT}`);
-  console.log(`Webhook: https://intercom-validator-production.up.railway.app/validate-email`);
 });
