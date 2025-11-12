@@ -17,7 +17,7 @@ if (!INTERCOM_TOKEN || !LIST_URL) {
 // === ФОНОВАЯ ПРОВЕРКА ===
 async function validateAndSetCustom(contactId, email, purchaseEmail) {
   const emailsToCheck = [email, purchaseEmail].filter(e => e && e.includes('@'));
-  if (emailsToCheck.length === 0) return;
+  if (emailsToCheck.length === 0 || !contactId) return;
 
   try {
     console.log(`[ФОН] Проверка для ID ${contactId}: ${emailsToCheck.join(', ')}`);
@@ -43,13 +43,11 @@ async function validateAndSetCustom(contactId, email, purchaseEmail) {
         });
         console.log(`[ФОН] ${CUSTOM_ATTR_NAME} = true (Status: ${response.status})`);
       } catch (apiError) {
-        console.error(`[ФОН] Полная ошибка API для ${contactId}: Status ${apiError.response?.status}, Data:`, apiError.response?.data || apiError.message);
+        console.error(`[ФОН] Ошибка API: ${apiError.response?.status} |`, apiError.response?.data || apiError.message);
       }
-    } else {
-      console.log(`[ФОН] Нет совпадения для ${contactId}`);
     }
   } catch (e) {
-    console.error('[ФОН] Критическая ошибка:', e.message);
+    console.error('[ФОН] Ошибка:', e.message);
   }
 }
 
@@ -71,34 +69,37 @@ app.post('/validate-email', async (req, res) => {
   }
 
   const author = item.author;
-  const contactId = item.contacts?.contacts?.[0]?.id || author.id; // ID из контакта или author
+  const contacts = item.contacts?.contacts || [];
+  const contact = contacts[0];
 
+  // === 3. БЕЗОПАСНАЯ ПРОВЕРКА AUTHOR ===
+  if (!author || !author.email || !author.email.includes('@')) {
+    console.log('Нет валидного author.email');
+    return res.status(400).json({ error: 'No valid author email' });
+  }
+
+  // === 4. ФИЛЬТР БОТОВ ===
+  if (
+    author.type === 'bot' ||
+    author.from_ai_agent === true ||
+    author.is_ai_answer === true ||
+    author.email.includes('operator+') ||
+    author.email.includes('@intercom.io')
+  ) {
+    console.log(`Бот пропущен: ${author.name || 'Unknown'} (${author.email})`);
+    return res.status(200).json({ skipped: true, reason: 'bot' });
+  }
+
+  // === 5. CONTACT ID (из contacts или author) ===
+  const contactId = contact?.id || author.id;
   if (!contactId) {
     console.log('Нет contact ID');
     return res.status(400).json({ error: 'No contact ID' });
   }
 
-  // === 3. ФИЛЬТР БОТОВ ===
-  if (
-    author?.type === 'bot' ||
-    author?.from_ai_agent === true ||
-    author?.is_ai_answer === true ||
-    author?.email?.includes('operator+') ||
-    author?.email?.includes('@intercom.io')
-  ) {
-    console.log(`Бот пропущен: ${author?.name} (${author?.email})`);
-    return res.status(200).json({ skipped: true, reason: 'bot_message' });
-  }
-
-  // === 4. ПОЛУЧАЕМ EMAIL (из author для user.replied) ===
   const email = author.email;
 
-  if (!email || !email.includes('@')) {
-    console.log('Нет email в author');
-    return res.status(400).json({ error: 'No email' });
-  }
-
-  // === 5. ПОЛУЧАЕМ PURCHASE EMAIL (API-вызов по ID) ===
+  // === 6. ПОЛУЧАЕМ PURCHASE EMAIL (GET /contacts/{id}) ===
   let purchaseEmail = null;
   try {
     const contactResponse = await axios.get(`https://api.intercom.io/contacts/${contactId}`, {
@@ -109,15 +110,15 @@ app.post('/validate-email', async (req, res) => {
       timeout: 3000
     });
     purchaseEmail = contactResponse.data.custom_attributes?.['Purchase email'];
-    console.log(`[API] Purchase email для ${contactId}: ${purchaseEmail}`);
+    console.log(`[API] Purchase email: ${purchaseEmail || 'не найден'}`);
   } catch (e) {
-    console.error('[API] Ошибка получения контакта:', e.response?.status || e.message);
+    console.error('[API] Ошибка получения контакта:', e.message);
   }
 
-  // === 6. ОТВЕЧАЕМ СРАЗУ ===
+  // === 7. ОТВЕЧАЕМ СРАЗУ ===
   res.status(200).json({ received: true, email, purchaseEmail, contactId });
 
-  // === 7. ФОНОВАЯ ПРОВЕРКА ===
+  // === 8. ФОНОВАЯ ПРОВЕРКА ===
   validateAndSetCustom(contactId, email, purchaseEmail);
 });
 
@@ -127,6 +128,8 @@ app.head('/validate-email', (req, res) => {
 });
 
 // === ЗАПУСК ===
-app.listen(process.env.PORT, () => {
-  console.log(`Сервер запущен на порту ${process.env.PORT}`);
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Сервер запущен на порту ${PORT}`);
+  console.log(`Webhook: https://intercom-validator-production.up.railway.app/validate-email`);
 });
