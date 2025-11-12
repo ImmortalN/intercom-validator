@@ -94,6 +94,14 @@ app.post('/validate-email', async (req, res) => {
   }
 });
 
+// Универсальный handler для GET/HEAD (для тестов Intercom)
+app.use('/validate-email', (req, res) => {
+  if (req.method === 'GET' || req.method === 'HEAD') {
+    console.log(`Test request: ${req.method}`);
+    res.status(200).json({ status: 'OK', ready: true });
+  }
+});
+
 // === ЗАПУСК СЕРВЕРА ===
 app.listen(process.env.PORT, () => {
   console.log(`Сервер запущен на порту ${process.env.PORT}`);
