@@ -8,7 +8,8 @@ app.use(express.json());
 const INTERCOM_TOKEN = process.env.INTERCOM_TOKEN;
 const LIST_URL = process.env.LIST_URL;
 const CUSTOM_ATTR_NAME = process.env.CUSTOM_ATTR_NAME || 'Unpaid Custom';
-const ADMIN_ID = process.env.ADMIN_ID; // ← НОВОЕ: твой Intercom Admin ID
+const ADMIN_ID = process.env.ADMIN_ID;
+const INTERCOM_VERSION = '2.14'; // ← ВАЖНО!
 
 if (!INTERCOM_TOKEN || !LIST_URL || !ADMIN_ID) {
   console.error('ОШИБКА: INTERCOM_TOKEN, LIST_URL или ADMIN_ID не заданы!');
@@ -22,7 +23,11 @@ async function validateAndSetCustom(contactId, conversationId) {
   try {
     // 1. Получаем контакт
     const contactRes = await axios.get(`https://api.intercom.io/contacts/${contactId}`, {
-      headers: { 'Authorization': `Bearer ${INTERCOM_TOKEN}`, 'Accept': 'application/json' },
+      headers: { 
+        'Authorization': `Bearer ${INTERCOM_TOKEN}`, 
+        'Accept': 'application/json',
+        'Intercom-Version': INTERCOM_VERSION 
+      },
       timeout: 5000
     });
 
@@ -51,23 +56,26 @@ async function validateAndSetCustom(contactId, conversationId) {
       headers: {
         'Authorization': `Bearer ${INTERCOM_TOKEN}`,
         'Content-Type': 'application/json',
-        'Accept': 'application/json'
+        'Accept': 'application/json',
+        'Intercom-Version': INTERCOM_VERSION
       },
       timeout: 4000
     });
     console.log(`Unpaid Custom = true → ${contactId}`);
 
-    // 4. ДОБАВЛЯЕМ ЗАМЕТКУ В ЧАТ
+    // 4. ДОБАВЛЯЕМ ЗАМЕТКУ ЧЕРЕЗ /reply (как в твоём переводчике)
     if (conversationId) {
       try {
-        await axios.post(`https://api.intercom.io/conversations/${conversationId}/notes`, {
-          body: "Email validated - custom attribute updated",
-          author_id: ADMIN_ID
+        await axios.post(`https://api.intercom.io/conversations/${conversationId}/reply`, {
+          message_type: 'note',
+          admin_id: ADMIN_ID,
+          body: 'Attention!!! Клиент не заплатил за кастом - саппорт не предоставляем' // ← ТЕКСТ ЗДЕСЬ
         }, {
           headers: {
             'Authorization': `Bearer ${INTERCOM_TOKEN}`,
             'Content-Type': 'application/json',
-            'Accept': 'application/json'
+            'Accept': 'application/json',
+            'Intercom-Version': INTERCOM_VERSION
           },
           timeout: 4000
         });
@@ -88,7 +96,7 @@ app.post('/validate-email', async (req, res) => {
 
   const author = item.author;
   const contactId = item.contacts?.contacts?.[0]?.id || author?.id;
-  const conversationId = item.id; // ← ВОТ ОНО!
+  const conversationId = item.id;
 
   // Фильтр ботов
   if (
