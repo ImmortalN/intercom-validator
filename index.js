@@ -14,8 +14,10 @@ if (!INTERCOM_TOKEN || !LIST_URL) {
   process.exit(1);
 }
 
-// === АСИНХРОННАЯ ОБРАБОТКА ===
+// === ФОНОВАЯ ПРОВЕРКА ===
 async function processEmailValidation(email) {
+  if (!email || !email.includes('@')) return;
+
   try {
     console.log(`[ФОН] Проверка: ${email}`);
     const { data: emailList } = await axios.get(LIST_URL, { timeout: 3000 });
@@ -36,10 +38,10 @@ async function processEmailValidation(email) {
           },
           timeout: 4000
         });
-        console.log('[ФОН] Intercom: обновлено');
+        console.log('[ФОН] Intercom: Custom = true (200)');
       } catch (e) {
         if (e.response?.status === 409) {
-          console.log('[ФОН] 409 OK');
+          console.log('[ФОН] 409 OK — уже установлено');
         }
       }
     }
@@ -48,42 +50,58 @@ async function processEmailValidation(email) {
   }
 }
 
+// === POST: Webhook от Intercom ===
 app.post('/validate-email', async (req, res) => {
   console.log('Webhook получен:', JSON.stringify(req.body, null, 2));
 
-  // === ТЕСТ PING ===
+  // === 1. PING ТЕСТ ===
   if (req.body.type === "notification_event" && req.body.data?.item?.type === "ping") {
     console.log('Intercom Test: PING');
     return res.status(200).json({ message: "Webhook test received" });
   }
 
-  // === ИЗВЛЕЧЕНИЕ EMAIL (УНИВЕРСАЛЬНОЕ) ===
-  let email = '';
-  if (req.body.data?.item?.email) {
-    email = req.body.data.item.email;
-  } else if (req.body.data?.email) {
-    email = req.body.data.email;
-  } else if (req.body.email) {
-    email = req.body.email;
+  // === 2. ИЗВЛЕЧЕНИЕ КОНТАКТА ИЗ CONVERSATION ===
+  const conversation = req.body.data?.item;
+  const contact = conversation?.contacts?.contacts?.[0];
+
+  if (!contact) {
+    console.log('Контакт не найден в conversation');
+    return res.status(400).json({ error: 'No contact in conversation' });
   }
 
-  if (!email || !email.includes('@')) {
-    console.log('Email НЕ найден в payload');
-    return res.status(400).json({ error: 'No valid email' });
+  const email = contact.email;
+  const purchaseEmail = contact.custom_attributes?.purchase_email;
+  const role = contact.role;
+
+  // === 3. ФИЛЬТР: ТОЛЬКО РЕАЛЬНЫЕ КЛИЕНТЫ ===
+  if (!email && !purchaseEmail) {
+    console.log('Ни один email не найден');
+    return res.status(400).json({ error: 'No email or purchase_email' });
   }
 
-  console.log(`Найден email: ${email}`);
+  if (email?.includes('operator+') || email?.includes('@intercom.io')) {
+    console.log(`Бот пропущен: ${email}`);
+    return res.status(200).json({ skipped: true, reason: 'bot' });
+  }
 
-  // ОТВЕЧАЕМ СРАЗУ
-  res.status(200).json({ received: true, email });
+  if (!['lead', 'user'].includes(role)) {
+    console.log(`Роль не подходит: ${role}`);
+    return res.status(200).json({ skipped: true, reason: 'role' });
+  }
 
-  // ОБРАБАТЫВАЕМ В ФОНЕ
-  processEmailValidation(email).catch(console.error);
+  // === 4. ПРОВЕРЯЕМ ОБА ПОЛЯ ===
+  const emailsToCheck = [email, purchaseEmail].filter(Boolean);
+  console.log(`Проверяем email(s): ${emailsToCheck.join(', ')}`);
+
+  // === 5. ОТВЕЧАЕМ СРАЗУ ===
+  res.status(200).json({ received: true, emails: emailsToCheck, role });
+
+  // === 6. ФОНОВАЯ ПРОВЕРКА ===
+  emailsToCheck.forEach(email => processEmailValidation(email));
 });
 
 // === HEAD: валидация ===
 app.head('/validate-email', (req, res) => {
-  console.log('Intercom: HEAD validation');
   res.status(200).send('OK');
 });
 
