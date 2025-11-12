@@ -4,62 +4,32 @@ const app = express();
 
 app.use(express.json());
 
-// === НАСТРОЙКИ (из переменных окружения) ===
+// === ПЕРЕМЕННЫЕ ===
 const INTERCOM_TOKEN = process.env.INTERCOM_TOKEN;
 const LIST_URL = process.env.LIST_URL;
-const CUSTOM_ATTR_NAME = process.env.CUSTOM_ATTR_NAME || 'Custom';
+const CUSTOM_ATTR_NAME = process.env.CUSTOM_ATTR_NAME || 'Unpaid Custom';
 
-// Проверка, что токены заданы
 if (!INTERCOM_TOKEN || !LIST_URL) {
-  console.error('ОШИБКА: INTERCOM_TOKEN или LIST_URL не заданы в переменных окружения!');
+  console.error('ОШИБКА: INTERCOM_TOKEN или LIST_URL не заданы!');
   process.exit(1);
 }
 
-// === HEAD-handler для валидации Intercom (тест при сохранении webhook) ===
-app.head('/validate-email', (req, res) => {
-  console.log('Intercom validation: HEAD request received');
-  res.status(200).send('OK');
-});
-
-// === POST-handler: основной webhook от Intercom ===
-app.post('/validate-email', async (req, res) => {
-  console.log('Webhook received:', JSON.stringify(req.body, null, 2));
-
-  // Извлекаем email из payload Intercom
-  let email = '';
+// === АСИНХРОННАЯ ОБРАБОТКА (в фоне) ===
+async function processEmailValidation(email) {
   try {
-    if (req.body.data && req.body.data.email) {
-      email = req.body.data.email;
-    } else if (req.body.data && req.body.data.attributes && req.body.data.attributes.email) {
-      email = req.body.data.attributes.email;
-    } else if (req.body.email) {
-      email = req.body.email; // для тестов в Postman
-    }
-  } catch (e) {
-    console.error('Ошибка парсинга email:', e.message);
-  }
+    console.log(`[ФОН] Обрабатываем: ${email}`);
 
-  if (!email || !email.includes('@')) {
-    console.log('Email не найден или некорректный:', email);
-    return res.status(400).json({ error: 'No valid email in payload' });
-  }
-
-  console.log(`Обрабатываем email: ${email}`);
-
-  try {
-    // 1. Загружаем список emails
-    const { data: emailList } = await axios.get(LIST_URL);
-    if (!Array.isArray(emailList)) {
-      throw new Error('Список emails не является массивом');
-    }
+    // 1. Загружаем список (таймаут 3 сек)
+    const { data: emailList } = await axios.get(LIST_URL, { timeout: 3000 });
+    if (!Array.isArray(emailList)) throw new Error('Invalid list');
 
     // 2. Проверяем совпадение
     const isMatch = emailList.some(e =>
       typeof e === 'string' && e.trim().toLowerCase() === email.trim().toLowerCase()
     );
-    console.log(`Совпадение в списке: ${isMatch}`);
+    console.log(`[ФОН] Совпадение: ${isMatch}`);
 
-    // 3. Если совпадение — обновляем Intercom
+    // 3. Обновляем Intercom
     if (isMatch) {
       const payload = {
         email: email,
@@ -72,38 +42,55 @@ app.post('/validate-email', async (req, res) => {
             'Authorization': `Bearer ${INTERCOM_TOKEN}`,
             'Content-Type': 'application/json',
             'Accept': 'application/json'
-          }
+          },
+          timeout: 4000
         });
-        console.log('Intercom: контакт обновлён/создан (200)');
+        console.log('[ФОН] Intercom: обновлено (200)');
       } catch (apiError) {
         if (apiError.response?.status === 409) {
-          console.log('Intercom: контакт уже существует — атрибут обновлён (409 OK)');
+          console.log('[ФОН] Intercom: уже существует (409 OK)');
         } else {
-          console.error('Ошибка Intercom API:', apiError.response?.data || apiError.message);
-          throw apiError;
+          console.error('[ФОН] Intercom API error:', apiError.message);
         }
       }
     }
-
-    // Отвечаем Intercom — 200 OK
-    res.status(200).json({ match: isMatch, processed: true, email });
-
   } catch (error) {
-    console.error('Критическая ошибка:', error.message);
-    res.status(500).json({ error: 'Internal server error', details: error.message });
+    console.error('[ФОН] Критическая ошибка:', error.message);
   }
+}
+
+// === HEAD: валидация Intercom ===
+app.head('/validate-email', (req, res) => {
+  console.log('Intercom: HEAD validation');
+  res.status(200).send('OK');
 });
 
-// Универсальный handler для GET/HEAD (для тестов Intercom)
-app.use('/validate-email', (req, res) => {
-  if (req.method === 'GET' || req.method === 'HEAD') {
-    console.log(`Test request: ${req.method}`);
-    res.status(200).json({ status: 'OK', ready: true });
+// === POST: основной webhook ===
+app.post('/validate-email', async (req, res) => {
+  let email = '';
+
+  // Извлекаем email
+  try {
+    if (req.body.data?.email) email = req.body.data.email;
+    else if (req.body.data?.attributes?.email) email = req.body.data.attributes.email;
+    else if (req.body.email) email = req.body.email;
+  } catch (e) {}
+
+  if (!email || !email.includes('@')) {
+    console.log('Email не найден:', req.body);
+    return res.status(400).json({ error: 'No valid email' });
   }
+
+  console.log(`Webhook получен: ${email}`);
+
+  // ОТВЕЧАЕМ СРАЗУ — тест пройдёт!
+  res.status(200).json({ received: true, email });
+
+  // ОБРАБАТЫВАЕМ В ФОНЕ
+  processEmailValidation(email).catch(console.error);
 });
 
-// === ЗАПУСК СЕРВЕРА ===
+// === ЗАПУСК ===
 app.listen(process.env.PORT, () => {
   console.log(`Сервер запущен на порту ${process.env.PORT}`);
-  console.log(`Webhook URL: https://intercom-validator-production.up.railway.app/validate-email`);
 });
