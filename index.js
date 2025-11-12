@@ -13,6 +13,11 @@ if (!INTERCOM_TOKEN || !LIST_URL) {
   process.exit(1);
 }
 
+// Healthcheck для теста Intercom
+app.get('/health', (req, res) => {
+  res.status(200).json({ status: 'OK', message: 'Webhook ready' });
+});
+
 app.post('/validate-email', async (req, res) => {
   const { email } = req.body;
   if (!email) return res.status(400).json({ error: 'No email' });
