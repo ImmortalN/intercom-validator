@@ -41,7 +41,7 @@ async function validateAndSetCustom(email) {
         console.log(`[ФОН] Custom = true для ${email}`);
       } catch (e) {
         if (e.response?.status === 409) {
-          console.log(`[ФОН] 409 OK — уже установлено для ${email}`);
+          console.log(`[ФОН] 409 OK — уже установлено`);
         }
       }
     }
@@ -65,43 +65,44 @@ app.post('/validate-email', async (req, res) => {
   const author = conversation?.author;
   const contact = conversation?.contacts?.contacts?.[0];
 
-  if (!conversation || !contact) {
-    console.log('Нет conversation или contact');
+  if (!conversation || !contact || !author) {
+    console.log('Нет conversation / contact / author');
     return res.status(400).json({ error: 'Invalid payload' });
   }
 
-  // === 3. ФИЛЬТР БОТОВ (по Intercom) ===
+  // === 3. ТОЛЬКО СООБЩЕНИЯ ОТ ПОЛЬЗОВАТЕЛЯ (не бот) ===
   if (
-    author?.type === 'bot' ||
-    author?.from_ai_agent === true ||
-    author?.is_ai_answer === true ||
-    author?.email?.includes('operator+') ||
-    author?.email?.includes('@intercom.io')
+    author.type === 'bot' ||
+    author.from_ai_agent === true ||
+    author.is_ai_answer === true ||
+    author.email?.includes('operator+') ||
+    author.email?.includes('@intercom.io')
   ) {
-    console.log(`Бот пропущен: ${author?.name || 'Unknown'} (${author?.email || 'no email'})`);
+    console.log(`Бот пропущен: ${author.name} (${author.email})`);
     return res.status(200).json({ skipped: true, reason: 'bot_message' });
   }
 
-  // === 4. ФИЛЬТР РОЛИ ===
-  if (!['lead', 'user'].includes(contact.role)) {
-    console.log(`Роль не подходит: ${contact.role}`);
-    return res.status(200).json({ skipped: true, reason: 'role' });
+  // === 4. ТОЛЬКО lead / user (НЕ null) ===
+  const role = contact.role || 'unknown';
+  if (!['lead', 'user'].includes(role)) {
+    console.log(`Роль не подходит: ${role}`);
+    return res.status(200).json({ skipped: true, reason: 'role', role });
   }
 
-  // === 5. ПОЛУЧАЕМ ОБА EMAIL ===
+  // === 5. ПОЛУЧАЕМ EMAIL ===
   const email = contact.email;
   const purchaseEmail = contact.custom_attributes?.purchase_email;
 
   const emailsToCheck = [email, purchaseEmail].filter(e => e && e.includes('@'));
   if (emailsToCheck.length === 0) {
     console.log('Нет валидных email');
-    return res.status(400).json({ error: 'No valid email' });
+    return res.status(400).json({ error: 'No email' });
   }
 
-  console.log(`Обрабатываем: ${emailsToCheck.join(', ')} (role: ${contact.role})`);
+  console.log(`Обрабатываем от ${author.name || 'User'}: ${emailsToCheck.join(', ')} (role: ${role})`);
 
   // === 6. ОТВЕЧАЕМ СРАЗУ ===
-  res.status(200).json({ received: true, emails: emailsToCheck, role: contact.role });
+  res.status(200).json({ received: true, emails: emailsToCheck, role, author: author.name });
 
   // === 7. ФОНОВАЯ ПРОВЕРКА ===
   emailsToCheck.forEach(email => validateAndSetCustom(email));
