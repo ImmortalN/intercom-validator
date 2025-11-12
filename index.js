@@ -15,16 +15,35 @@ if (!INTERCOM_TOKEN || !LIST_URL) {
 }
 
 // === ФОНОВАЯ ПРОВЕРКА ===
-async function validateAndSetCustom(contactId, email, purchaseEmail) {
-  const emailsToCheck = [email, purchaseEmail].filter(e => e && e.includes('@'));
-  if (emailsToCheck.length === 0 || !contactId) return;
+async function validateAndSetCustom(contactId) {
+  if (!contactId) return;
 
   try {
-    console.log(`[ФОН] Проверка для ID ${contactId}: ${emailsToCheck.join(', ')}`);
+    console.log(`[ФОН] Получаем контакт по ID: ${contactId}`);
+    const contactResponse = await axios.get(`https://api.intercom.io/contacts/${contactId}`, {
+      headers: {
+        'Authorization': `Bearer ${INTERCOM_TOKEN}`,
+        'Accept': 'application/json'
+      },
+      timeout: 5000
+    });
+
+    const contact = contactResponse.data;
+    const email = contact.email;
+    const purchaseEmail = contact.custom_attributes?.['Purchase email'];
+
+    const emailsToCheck = [email, purchaseEmail].filter(e => e && e.includes('@'));
+    if (emailsToCheck.length === 0) {
+      console.log(`[ФОН] Нет email для ${contactId}`);
+      return;
+    }
+
+    console.log(`[ФОН] Проверка: ${emailsToCheck.join(', ')}`);
+
     const { data: emailList } = await axios.get(LIST_URL, { timeout: 3000 });
     if (!Array.isArray(emailList)) return;
 
-    const isMatch = emailsToCheck.some(e => 
+    const isMatch = emailsToCheck.some(e =>
       emailList.some(listEmail =>
         typeof listEmail === 'string' && listEmail.trim().toLowerCase() === e.trim().toLowerCase()
       )
@@ -33,7 +52,7 @@ async function validateAndSetCustom(contactId, email, purchaseEmail) {
     if (isMatch) {
       const payload = { custom_attributes: { [CUSTOM_ATTR_NAME]: true } };
       try {
-        const response = await axios.put(`https://api.intercom.io/contacts/${contactId}`, payload, {
+        await axios.put(`https://api.intercom.io/contacts/${contactId}`, payload, {
           headers: {
             'Authorization': `Bearer ${INTERCOM_TOKEN}`,
             'Content-Type': 'application/json',
@@ -41,9 +60,9 @@ async function validateAndSetCustom(contactId, email, purchaseEmail) {
           },
           timeout: 4000
         });
-        console.log(`[ФОН] ${CUSTOM_ATTR_NAME} = true (Status: ${response.status})`);
-      } catch (apiError) {
-        console.error(`[ФОН] Ошибка API: ${apiError.response?.status} |`, apiError.response?.data || apiError.message);
+        console.log(`[ФОН] ${CUSTOM_ATTR_NAME} = true для ${contactId}`);
+      } catch (e) {
+        console.error(`[ФОН] Ошибка PUT:`, e.response?.data || e.message);
       }
     }
   } catch (e) {
@@ -72,54 +91,32 @@ app.post('/validate-email', async (req, res) => {
   const contacts = item.contacts?.contacts || [];
   const contact = contacts[0];
 
-  // === 3. БЕЗОПАСНАЯ ПРОВЕРКА AUTHOR ===
-  if (!author || !author.email || !author.email.includes('@')) {
-    console.log('Нет валидного author.email');
-    return res.status(400).json({ error: 'No valid author email' });
-  }
-
-  // === 4. ФИЛЬТР БОТОВ ===
+  // === 3. ФИЛЬТР БОТОВ ===
   if (
+    !author ||
     author.type === 'bot' ||
     author.from_ai_agent === true ||
     author.is_ai_answer === true ||
-    author.email.includes('operator+') ||
-    author.email.includes('@intercom.io')
+    (author.email && (author.email.includes('operator+') || author.email.includes('@intercom.io')))
   ) {
-    console.log(`Бот пропущен: ${author.name || 'Unknown'} (${author.email})`);
+    console.log(`Бот пропущен: ${author?.name || 'Unknown'}`);
     return res.status(200).json({ skipped: true, reason: 'bot' });
   }
 
-  // === 5. CONTACT ID (из contacts или author) ===
-  const contactId = contact?.id || author.id;
+  // === 4. ПОЛУЧАЕМ CONTACT ID ===
+  const contactId = contact?.id || author?.id;
   if (!contactId) {
     console.log('Нет contact ID');
     return res.status(400).json({ error: 'No contact ID' });
   }
 
-  const email = author.email;
+  console.log(`Обрабатываем контакт ID: ${contactId}`);
 
-  // === 6. ПОЛУЧАЕМ PURCHASE EMAIL (GET /contacts/{id}) ===
-  let purchaseEmail = null;
-  try {
-    const contactResponse = await axios.get(`https://api.intercom.io/contacts/${contactId}`, {
-      headers: {
-        'Authorization': `Bearer ${INTERCOM_TOKEN}`,
-        'Accept': 'application/json'
-      },
-      timeout: 3000
-    });
-    purchaseEmail = contactResponse.data.custom_attributes?.['Purchase email'];
-    console.log(`[API] Purchase email: ${purchaseEmail || 'не найден'}`);
-  } catch (e) {
-    console.error('[API] Ошибка получения контакта:', e.message);
-  }
+  // === 5. ОТВЕЧАЕМ СРАЗУ ===
+  res.status(200).json({ received: true, contactId });
 
-  // === 7. ОТВЕЧАЕМ СРАЗУ ===
-  res.status(200).json({ received: true, email, purchaseEmail, contactId });
-
-  // === 8. ФОНОВАЯ ПРОВЕРКА ===
-  validateAndSetCustom(contactId, email, purchaseEmail);
+  // === 6. ФОНОВАЯ ПРОВЕРКА (через API) ===
+  validateAndSetCustom(contactId);
 });
 
 // === HEAD ===
