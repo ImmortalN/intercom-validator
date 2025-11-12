@@ -48,28 +48,31 @@ async function processEmailValidation(email) {
   }
 }
 
-// === POST: Webhook от Intercom ===
 app.post('/validate-email', async (req, res) => {
   console.log('Webhook получен:', JSON.stringify(req.body, null, 2));
 
-  // === ТЕСТОВЫЙ PING ОТ INTERCOM ===
+  // === ТЕСТ PING ===
   if (req.body.type === "notification_event" && req.body.data?.item?.type === "ping") {
-    console.log('Intercom Webhook Test: PING received');
-    return res.status(200).json({ message: "Webhook test received successfully" });
+    console.log('Intercom Test: PING');
+    return res.status(200).json({ message: "Webhook test received" });
   }
 
-  // === РЕАЛЬНЫЙ КОНТАКТ ===
+  // === ИЗВЛЕЧЕНИЕ EMAIL (УНИВЕРСАЛЬНОЕ) ===
   let email = '';
-  try {
-    if (req.body.data?.email) email = req.body.data.email;
-    else if (req.body.data?.attributes?.email) email = req.body.data.attributes.email;
-    else if (req.body.email) email = req.body.email;
-  } catch (e) {}
+  if (req.body.data?.item?.email) {
+    email = req.body.data.item.email;
+  } else if (req.body.data?.email) {
+    email = req.body.data.email;
+  } else if (req.body.email) {
+    email = req.body.email;
+  }
 
   if (!email || !email.includes('@')) {
-    console.log('Email не найден в payload');
+    console.log('Email НЕ найден в payload');
     return res.status(400).json({ error: 'No valid email' });
   }
+
+  console.log(`Найден email: ${email}`);
 
   // ОТВЕЧАЕМ СРАЗУ
   res.status(200).json({ received: true, email });
