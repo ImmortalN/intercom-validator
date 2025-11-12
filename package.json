@@ -1,5 +1,5 @@
 {
-  "name": "intercom-validator",
+  "name": "intercom-webhook",
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
