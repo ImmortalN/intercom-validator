@@ -91,7 +91,7 @@ async function validateAndSetCustom(contactId, conversationId) {
           await axios.post(`https://api.intercom.io/conversations/${conversationId}/reply`, {
             message_type: 'note',
             admin_id: ADMIN_ID,
-            body: 'Attention!!! Клиент не заплатил за кастом - саппорт не предоставляем'
+            body: 'Attention!!! Клієнт не оплатив кастом - тому сапорт обмежений. Мʼяко пояснюємо, що ми будемо раді допомогти після оплати.'
           }, {
             headers: {
               'Authorization': `Bearer ${INTERCOM_TOKEN}`,
