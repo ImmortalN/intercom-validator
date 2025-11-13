@@ -10,44 +10,46 @@ const LIST_URL = process.env.LIST_URL;
 const CUSTOM_ATTR_NAME = process.env.CUSTOM_ATTR_NAME || 'Unpaid Custom';
 const ADMIN_ID = process.env.ADMIN_ID;
 const INTERCOM_VERSION = '2.14';
+const DELAY_MS = 30000; // 30 секунд — подбери под свой workflow
 
 // Глобальные Set'ы
-const processedConversations = new Set();           // Для Unpaid Custom
-const processedSubscriptionConversations = new Set(); // Для Subscription
+const processedConversations = new Set();
+const processedSubscriptionConversations = new Set();
 
 if (!INTERCOM_TOKEN || !LIST_URL || !ADMIN_ID) {
   console.error('ОШИБКА: INTERCOM_TOKEN, LIST_URL или ADMIN_ID не заданы!');
   process.exit(1);
 }
 
-// === ДОБАВЛЕНИЕ ЗАМЕТКИ (универсальная функция) ===
-async function addNote(conversationId, text) {
-  try {
-    await axios.post(`https://api.intercom.io/conversations/${conversationId}/reply`, {
-      message_type: 'note',
-      admin_id: ADMIN_ID,
-      body: text
-    }, {
-      headers: {
-        'Authorization': `Bearer ${INTERCOM_TOKEN}`,
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-        'Intercom-Version': INTERCOM_VERSION
-      },
-      timeout: 4000
-    });
-    console.log(`Заметка добавлена: "${text}" → ${conversationId}`);
-  } catch (error) {
-    console.error(`Ошибка заметки:`, error.response?.data || error.message);
-  }
+// === ДОБАВЛЕНИЕ ЗАМЕТКИ (с делеем) ===
+async function addNoteWithDelay(conversationId, text, delay = DELAY_MS) {
+  setTimeout(async () => {
+    try {
+      await axios.post(`https://api.intercom.io/conversations/${conversationId}/reply`, {
+        message_type: 'note',
+        admin_id: ADMIN_ID,
+        body: text
+      }, {
+        headers: {
+          'Authorization': `Bearer ${INTERCOM_TOKEN}`,
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+          'Intercom-Version': INTERCOM_VERSION
+        },
+        timeout: 4000
+      });
+      console.log(`Заметка добавлена (через ${delay/1000}с): "${text}" → ${conversationId}`);
+    } catch (error) {
+      console.error(`Ошибка заметки (через ${delay/1000}с):`, error.response?.data || error.message);
+    }
+  }, delay);
 }
 
-// === ФОНОВАЯ ПРОВЕРКА (Unpaid + Subscription) ===
+// === ФОНОВАЯ ПРОВЕРКА ===
 async function validateAndSetCustom(contactId, conversationId) {
   if (!contactId) return;
 
   try {
-    // 1. Получаем контакт
     const contactRes = await axios.get(`https://api.intercom.io/contacts/${contactId}`, {
       headers: {
         'Authorization': `Bearer ${INTERCOM_TOKEN}`,
@@ -91,16 +93,16 @@ async function validateAndSetCustom(contactId, conversationId) {
 
           if (conversationId && !processedConversations.has(conversationId)) {
             processedConversations.add(conversationId);
-            await addNote(conversationId, 'Attention!!! Клиент не заплатил за кастом - саппорт не предоставляем');
+            await addNoteWithDelay(conversationId, 'Attention!!! Клиент не заплатил за кастом - саппорт не предоставляем');
           }
         }
       }
     }
 
-    // === 2. ПРОВЕРКА SUBSCRIPTION (независимо от email) ===
+    // === 2. ПРОВЕРКА SUBSCRIPTION ===
     if (isEmptySubscription && conversationId && !processedSubscriptionConversations.has(conversationId)) {
       processedSubscriptionConversations.add(conversationId);
-      await addNote(conversationId, 'Заполните пожалуйста subscription');
+      await addNoteWithDelay(conversationId, 'Заполните пожалуйста subscription', 10000); // 10 сек — быстрее
     }
 
   } catch (e) {
@@ -117,7 +119,6 @@ app.post('/validate-email', async (req, res) => {
   const contactId = item.contacts?.contacts?.[0]?.id || author?.id;
   const conversationId = item.id;
 
-  // Фильтр ботов
   if (
     author?.type === 'bot' ||
     author?.from_ai_agent ||
@@ -127,7 +128,6 @@ app.post('/validate-email', async (req, res) => {
     return res.status(200).json({ skipped: 'bot' });
   }
 
-  // Проверяем дублирование (общее для всех проверок)
   if (conversationId && (processedConversations.has(conversationId) || processedSubscriptionConversations.has(conversationId))) {
     console.log(`Чат уже обработан: ${conversationId}`);
     return res.status(200).json({ skipped: 'already_processed' });
@@ -145,5 +145,5 @@ app.post('/validate-email', async (req, res) => {
 app.head('/validate-email', (req, res) => res.status(200).send('OK'));
 
 app.listen(process.env.PORT || 3000, () => {
-  console.log('Webhook готов — Unpaid + Subscription');
+  console.log('Webhook готов — с делеем');
 });
