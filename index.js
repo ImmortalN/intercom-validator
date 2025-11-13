@@ -24,12 +24,11 @@ async function validateAndSetCustom(contactId, conversationId) {
   if (!contactId) return;
 
   try {
-    // 1. Получаем контакт
     const contactRes = await axios.get(`https://api.intercom.io/contacts/${contactId}`, {
-      headers: { 
-        'Authorization': `Bearer ${INTERCOM_TOKEN}`, 
+      headers: {
+        'Authorization': `Bearer ${INTERCOM_TOKEN}`,
         'Accept': 'application/json',
-        'Intercom-Version': INTERCOM_VERSION 
+        'Intercom-Version': INTERCOM_VERSION
       },
       timeout: 5000
     });
@@ -42,23 +41,20 @@ async function validateAndSetCustom(contactId, conversationId) {
 
     if (emails.length === 0) return;
 
-    // 2. Получаем список
     const { data: emailList } = await axios.get(LIST_URL, { timeout: 3000 });
     if (!Array.isArray(emailList)) return;
 
-    const isMatch = emails.some(e => 
-      emailList.some(listE => 
+    const isMatch = emails.some(e =>
+      emailList.some(listE =>
         typeof listE === 'string' && listE.trim().toLowerCase() === e.trim().toLowerCase()
       )
     );
 
-    // 3. ЕСЛИ УЖЕ TRUE И СОВПАДАЕТ — ПРОПУСК
     if (currentCustomValue === true && isMatch) {
       console.log(`Уже Unpaid Custom = true → ${contactId}`);
       return;
     }
 
-    // 4. ЕСЛИ НЕ СОВПАДАЕТ — СБРАСЫВАЕМ В FALSE
     if (!isMatch && currentCustomValue !== false) {
       await axios.put(`https://api.intercom.io/contacts/${contactId}`, {
         custom_attributes: { [CUSTOM_ATTR_NAME]: false }
@@ -75,7 +71,6 @@ async function validateAndSetCustom(contactId, conversationId) {
       return;
     }
 
-    // 5. ЕСЛИ СОВПАДАЕТ И НЕ TRUE — СТАВИМ TRUE + ЗАМЕТКА
     if (isMatch) {
       await axios.put(`https://api.intercom.io/contacts/${contactId}`, {
         custom_attributes: { [CUSTOM_ATTR_NAME]: true }
@@ -90,14 +85,13 @@ async function validateAndSetCustom(contactId, conversationId) {
       });
       console.log(`Unpaid Custom = true → ${contactId}`);
 
-      // ДОБАВЛЯЕМ ЗАМЕТКУ ТОЛЬКО ОДИН РАЗ
       if (conversationId && !processedConversations.has(conversationId)) {
         processedConversations.add(conversationId);
         try {
           await axios.post(`https://api.intercom.io/conversations/${conversationId}/reply`, {
             message_type: 'note',
             admin_id: ADMIN_ID,
-            body: 'Attention!!! Клиент не заплатил за кастом - саппорт не предоставляем' // ← ТЕКСТ ЗДЕСЬ
+            body: 'Attention!!! Клиент не заплатил за кастом - саппорт не предоставляем'
           }, {
             headers: {
               'Authorization': `Bearer ${INTERCOM_TOKEN}`,
@@ -127,7 +121,6 @@ app.post('/validate-email', async (req, res) => {
   const contactId = item.contacts?.contacts?.[0]?.id || author?.id;
   const conversationId = item.id;
 
-  // Фильтр ботов
   if (
     author?.type === 'bot' ||
     author?.from_ai_agent ||
@@ -137,7 +130,6 @@ app.post('/validate-email', async (req, res) => {
     return res.status(200).json({ skipped: 'bot' });
   }
 
-  // ПРОВЕРКА: УЖЕ ОБРАБОТАН ЧАТ?
   if (conversationId && processedConversations.has(conversationId)) {
     console.log(`Чат уже обработан: ${conversationId}`);
     return res.status(200).json({ skipped: 'already_processed' });
