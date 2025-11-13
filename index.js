@@ -97,7 +97,7 @@ async function validateAndSetCustom(contactId, conversationId) {
           await axios.post(`https://api.intercom.io/conversations/${conversationId}/reply`, {
             message_type: 'note',
             admin_id: ADMIN_ID,
-            body: 'Email validated - custom attribute updated' // ← ТЕКСТ ЗДЕСЬ
+            body: 'Attention!!! Клиент не заплатил за кастом - саппорт не предоставляем' // ← ТЕКСТ ЗДЕСЬ
           }, {
             headers: {
               'Authorization': `Bearer ${INTERCOM_TOKEN}`,
