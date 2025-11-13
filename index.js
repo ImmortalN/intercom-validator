@@ -11,19 +11,43 @@ const CUSTOM_ATTR_NAME = process.env.CUSTOM_ATTR_NAME || 'Unpaid Custom';
 const ADMIN_ID = process.env.ADMIN_ID;
 const INTERCOM_VERSION = '2.14';
 
-// Глобальный Set для предотвращения дублирования по чату
-const processedConversations = new Set();
+// Глобальные Set'ы
+const processedConversations = new Set();           // Для Unpaid Custom
+const processedSubscriptionConversations = new Set(); // Для Subscription
 
 if (!INTERCOM_TOKEN || !LIST_URL || !ADMIN_ID) {
   console.error('ОШИБКА: INTERCOM_TOKEN, LIST_URL или ADMIN_ID не заданы!');
   process.exit(1);
 }
 
-// === ФОНОВАЯ ПРОВЕРКА ===
+// === ДОБАВЛЕНИЕ ЗАМЕТКИ (универсальная функция) ===
+async function addNote(conversationId, text) {
+  try {
+    await axios.post(`https://api.intercom.io/conversations/${conversationId}/reply`, {
+      message_type: 'note',
+      admin_id: ADMIN_ID,
+      body: text
+    }, {
+      headers: {
+        'Authorization': `Bearer ${INTERCOM_TOKEN}`,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'Intercom-Version': INTERCOM_VERSION
+      },
+      timeout: 4000
+    });
+    console.log(`Заметка добавлена: "${text}" → ${conversationId}`);
+  } catch (error) {
+    console.error(`Ошибка заметки:`, error.response?.data || error.message);
+  }
+}
+
+// === ФОНОВАЯ ПРОВЕРКА (Unpaid + Subscription) ===
 async function validateAndSetCustom(contactId, conversationId) {
   if (!contactId) return;
 
   try {
+    // 1. Получаем контакт
     const contactRes = await axios.get(`https://api.intercom.io/contacts/${contactId}`, {
       headers: {
         'Authorization': `Bearer ${INTERCOM_TOKEN}`,
@@ -37,76 +61,48 @@ async function validateAndSetCustom(contactId, conversationId) {
     const currentCustomValue = contact.custom_attributes?.[CUSTOM_ATTR_NAME];
     const email = contact.email;
     const purchaseEmail = contact.custom_attributes?.['Purchase email'];
+    const subscription = contact.custom_attributes?.['Subscription'];
+
     const emails = [email, purchaseEmail].filter(e => e && e.includes('@'));
+    const isEmptySubscription = !subscription || subscription === '';
 
-    if (emails.length === 0) return;
+    // === 1. ПРОВЕРКА EMAIL (Unpaid Custom) ===
+    if (emails.length > 0) {
+      const { data: emailList } = await axios.get(LIST_URL, { timeout: 3000 });
+      if (Array.isArray(emailList)) {
+        const isMatch = emails.some(e =>
+          emailList.some(listE =>
+            typeof listE === 'string' && listE.trim().toLowerCase() === e.trim().toLowerCase()
+          )
+        );
 
-    const { data: emailList } = await axios.get(LIST_URL, { timeout: 3000 });
-    if (!Array.isArray(emailList)) return;
+        if (currentCustomValue === true && isMatch) {
+          console.log(`Уже Unpaid Custom = true → ${contactId}`);
+        } else if (!isMatch && currentCustomValue !== false) {
+          await axios.put(`https://api.intercom.io/contacts/${contactId}`, {
+            custom_attributes: { [CUSTOM_ATTR_NAME]: false }
+          }, { headers: { 'Authorization': `Bearer ${INTERCOM_TOKEN}`, 'Content-Type': 'application/json', 'Intercom-Version': INTERCOM_VERSION } });
+          console.log(`Unpaid Custom = false → ${contactId}`);
+        } else if (isMatch) {
+          await axios.put(`https://api.intercom.io/contacts/${contactId}`, {
+            custom_attributes: { [CUSTOM_ATTR_NAME]: true }
+          }, { headers: { 'Authorization': `Bearer ${INTERCOM_TOKEN}`, 'Content-Type': 'application/json', 'Intercom-Version': INTERCOM_VERSION } });
+          console.log(`Unpaid Custom = true → ${contactId}`);
 
-    const isMatch = emails.some(e =>
-      emailList.some(listE =>
-        typeof listE === 'string' && listE.trim().toLowerCase() === e.trim().toLowerCase()
-      )
-    );
-
-    if (currentCustomValue === true && isMatch) {
-      console.log(`Уже Unpaid Custom = true → ${contactId}`);
-      return;
-    }
-
-    if (!isMatch && currentCustomValue !== false) {
-      await axios.put(`https://api.intercom.io/contacts/${contactId}`, {
-        custom_attributes: { [CUSTOM_ATTR_NAME]: false }
-      }, {
-        headers: {
-          'Authorization': `Bearer ${INTERCOM_TOKEN}`,
-          'Content-Type': 'application/json',
-          'Accept': 'application/json',
-          'Intercom-Version': INTERCOM_VERSION
-        },
-        timeout: 4000
-      });
-      console.log(`Unpaid Custom = false → ${contactId}`);
-      return;
-    }
-
-    if (isMatch) {
-      await axios.put(`https://api.intercom.io/contacts/${contactId}`, {
-        custom_attributes: { [CUSTOM_ATTR_NAME]: true }
-      }, {
-        headers: {
-          'Authorization': `Bearer ${INTERCOM_TOKEN}`,
-          'Content-Type': 'application/json',
-          'Accept': 'application/json',
-          'Intercom-Version': INTERCOM_VERSION
-        },
-        timeout: 4000
-      });
-      console.log(`Unpaid Custom = true → ${contactId}`);
-
-      if (conversationId && !processedConversations.has(conversationId)) {
-        processedConversations.add(conversationId);
-        try {
-          await axios.post(`https://api.intercom.io/conversations/${conversationId}/reply`, {
-            message_type: 'note',
-            admin_id: ADMIN_ID,
-            body: 'Attention!!! Клієнт не оплатив кастом - тому сапорт обмежений. Мʼяко пояснюємо, що ми будемо раді допомогти після оплати.'
-          }, {
-            headers: {
-              'Authorization': `Bearer ${INTERCOM_TOKEN}`,
-              'Content-Type': 'application/json',
-              'Accept': 'application/json',
-              'Intercom-Version': INTERCOM_VERSION
-            },
-            timeout: 4000
-          });
-          console.log(`Заметка добавлена: ${conversationId}`);
-        } catch (noteError) {
-          console.error(`Ошибка заметки:`, noteError.response?.data || noteError.message);
+          if (conversationId && !processedConversations.has(conversationId)) {
+            processedConversations.add(conversationId);
+            await addNote(conversationId, 'Attention!!! Клиент не заплатил за кастом - саппорт не предоставляем');
+          }
         }
       }
     }
+
+    // === 2. ПРОВЕРКА SUBSCRIPTION (независимо от email) ===
+    if (isEmptySubscription && conversationId && !processedSubscriptionConversations.has(conversationId)) {
+      processedSubscriptionConversations.add(conversationId);
+      await addNote(conversationId, 'Заполните пожалуйста subscription');
+    }
+
   } catch (e) {
     console.error(`Ошибка для ${contactId}:`, e.response?.data || e.message);
   }
@@ -121,6 +117,7 @@ app.post('/validate-email', async (req, res) => {
   const contactId = item.contacts?.contacts?.[0]?.id || author?.id;
   const conversationId = item.id;
 
+  // Фильтр ботов
   if (
     author?.type === 'bot' ||
     author?.from_ai_agent ||
@@ -130,7 +127,8 @@ app.post('/validate-email', async (req, res) => {
     return res.status(200).json({ skipped: 'bot' });
   }
 
-  if (conversationId && processedConversations.has(conversationId)) {
+  // Проверяем дублирование (общее для всех проверок)
+  if (conversationId && (processedConversations.has(conversationId) || processedSubscriptionConversations.has(conversationId))) {
     console.log(`Чат уже обработан: ${conversationId}`);
     return res.status(200).json({ skipped: 'already_processed' });
   }
@@ -147,5 +145,5 @@ app.post('/validate-email', async (req, res) => {
 app.head('/validate-email', (req, res) => res.status(200).send('OK'));
 
 app.listen(process.env.PORT || 3000, () => {
-  console.log('Webhook готов');
+  console.log('Webhook готов — Unpaid + Subscription');
 });
