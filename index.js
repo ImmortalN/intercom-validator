@@ -102,7 +102,7 @@ async function validateAndSetCustom(contactId, conversationId) {
     // === 2. ПРОВЕРКА SUBSCRIPTION ===
     if (isEmptySubscription && conversationId && !processedSubscriptionConversations.has(conversationId)) {
       processedSubscriptionConversations.add(conversationId);
-      await addNoteWithDelay(conversationId, 'Заполните пожалуйста subscription', 10000); // 10 сек — быстрее
+      await addNoteWithDelay(conversationId, 'Заповніть будь ласка subscription 😇🙏', 10000); // 10 сек — быстрее
     }
 
   } catch (e) {
