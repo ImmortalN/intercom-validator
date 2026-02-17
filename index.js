@@ -117,7 +117,7 @@ async function processSnoozedForAdmin(adminId) {
       for (const conv of convs) {
         const cid = conv.id;
         await unsnoozeConversation(cid, adminId);
-        await addNoteWithDelay(cid, PRESALE_NOTE_TEXT, 3000, adminId);
+        await addNoteWithDelay(cid, PRESALE_NOTE_TEXT, 3000, ADMIN_ID);
       }
 
       startingAfter = res.data.pages?.next?.starting_after;
