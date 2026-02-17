@@ -12,22 +12,32 @@ const ADMIN_ID = process.env.ADMIN_ID;
 const INTERCOM_VERSION = '2.14';
 const DELAY_MS = 30000; // 30 секунд — подбери под свой workflow
 
-// Глобальные Set'ы
-const processedConversations = new Set();
-const processedSubscriptionConversations = new Set();
+// === PRESALE НАСТРОЙКИ (новое) ===
+const PRESALE_TEAM_ID = process.env.PRESALE_TEAM_ID; // ID команды presale из Intercom (обязательно для фичи)
+const PRESALE_NOTE_TEXT = process.env.PRESALE_NOTE_TEXT || 'Агент вышел в онлайн — проверяем snoozed чаты presale 😎';
 
 if (!INTERCOM_TOKEN || !LIST_URL || !ADMIN_ID) {
   console.error('ОШИБКА: INTERCOM_TOKEN, LIST_URL или ADMIN_ID не заданы!');
   process.exit(1);
 }
+if (PRESALE_TEAM_ID) {
+  console.log(`✅ Presale feature активна для команды: ${PRESALE_TEAM_ID}`);
+  console.log(`   Текст заметки: "${PRESALE_NOTE_TEXT}"`);
+} else {
+  console.warn('⚠️  PRESALE_TEAM_ID не задан — фича "note + unsnooze при логине агента" отключена');
+}
 
-// === ДОБАВЛЕНИЕ ЗАМЕТКИ (с делеем) ===
-async function addNoteWithDelay(conversationId, text, delay = DELAY_MS) {
+// Глобальные Set'ы
+const processedConversations = new Set();
+const processedSubscriptionConversations = new Set();
+
+// === ДОБАВЛЕНИЕ ЗАМЕТКИ (с делеем) — обновлено: adminId optional ===
+async function addNoteWithDelay(conversationId, text, delay = DELAY_MS, adminId = ADMIN_ID) {
   setTimeout(async () => {
     try {
       await axios.post(`https://api.intercom.io/conversations/${conversationId}/reply`, {
         message_type: 'note',
-        admin_id: ADMIN_ID,
+        admin_id: adminId,
         body: text
       }, {
         headers: {
@@ -38,14 +48,35 @@ async function addNoteWithDelay(conversationId, text, delay = DELAY_MS) {
         },
         timeout: 4000
       });
-      console.log(`Заметка добавлена (через ${delay/1000}с): "${text}" → ${conversationId}`);
+      console.log(`Заметка добавлена (через ${delay/1000}с) от ${adminId}: "${text}" → ${conversationId}`);
     } catch (error) {
       console.error(`Ошибка заметки (через ${delay/1000}с):`, error.response?.data || error.message);
     }
   }, delay);
 }
 
-// === ФОНОВАЯ ПРОВЕРКА ===
+// === UNSNOOZE ЧАТА (message_type: open) ===
+async function unsnoozeConversation(conversationId, adminId = ADMIN_ID) {
+  try {
+    await axios.post(`https://api.intercom.io/conversations/${conversationId}/reply`, {
+      message_type: 'open',
+      admin_id: adminId
+    }, {
+      headers: {
+        'Authorization': `Bearer ${INTERCOM_TOKEN}`,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'Intercom-Version': INTERCOM_VERSION
+      },
+      timeout: 4000
+    });
+    console.log(`✅ Чат unsnoozed от ${adminId}: ${conversationId}`);
+  } catch (error) {
+    console.error(`Ошибка unsnooze:`, error.response?.data || error.message);
+  }
+}
+
+// === ФОНОВАЯ ПРОВЕРКА EMAIL/SUBSCRIPTION (оригинал без изменений) ===
 async function validateAndSetCustom(contactId, conversationId) {
   if (!contactId) return;
 
@@ -110,9 +141,95 @@ async function validateAndSetCustom(contactId, conversationId) {
   }
 }
 
-// === POST: Webhook ===
+// === НОВАЯ ФУНКЦИЯ: обработка snoozed чатов presale при логине агента ===
+async function processPresaleSnoozed(loggedAdminId) {
+  if (!PRESALE_TEAM_ID) return;
+  const adminIdForAction = loggedAdminId || ADMIN_ID;
+
+  try {
+    let startingAfter = null;
+    let page = 1;
+
+    while (true) {
+      const searchBody = {
+        query: {
+          operator: "AND",
+          value: [
+            {
+              field: "team_assignee_id",
+              operator: "=",
+              value: PRESALE_TEAM_ID
+            },
+            {
+              field: "state",
+              operator: "=",
+              value: "snoozed"
+            }
+          ]
+        },
+        pagination: {
+          per_page: 100
+        }
+      };
+
+      if (startingAfter) {
+        searchBody.pagination.starting_after = startingAfter;
+      }
+
+      const searchRes = await axios.post(`https://api.intercom.io/conversations/search`, searchBody, {
+        headers: {
+          'Authorization': `Bearer ${INTERCOM_TOKEN}`,
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+          'Intercom-Version': INTERCOM_VERSION
+        },
+        timeout: 10000
+      });
+
+      const conversations = searchRes.data.conversations || [];
+      console.log(`📋 Страница ${page}: найдено ${conversations.length} snoozed чатов в presale`);
+
+      for (const conv of conversations) {
+        const conversationId = conv.id;
+        // 1. Unsnooze сразу
+        await unsnoozeConversation(conversationId, adminIdForAction);
+        // 2. Заметка через 3 секунды (чтобы появлялась "вместе" с unsnooze)
+        await addNoteWithDelay(conversationId, PRESALE_NOTE_TEXT, 3000, adminIdForAction);
+      }
+
+      const pages = searchRes.data.pages;
+      startingAfter = pages?.next?.starting_after || null;
+      if (!startingAfter) break;
+
+      page++;
+      await new Promise(r => setTimeout(r, 1000)); // пауза между страницами
+    }
+  } catch (e) {
+    console.error(`❌ Ошибка processPresaleSnoozed:`, e.response?.data || e.message);
+  }
+}
+
+// === POST: Webhook (обновлено — теперь поддерживает admin.logged_in + оригинал) ===
 app.post('/validate-email', async (req, res) => {
-  const item = req.body.data?.item;
+  const body = req.body;
+  const topic = body.topic;
+
+  // === НОВОЕ: admin.logged_in — триггер для presale ===
+  if (topic === 'admin.logged_in') {
+    const adminItem = body.data?.item;
+    if (adminItem && adminItem.id) {
+      console.log(`👤 Admin logged in → ${adminItem.name || adminItem.email} (${adminItem.id})`);
+      res.status(200).json({ ok: true, topic: 'admin_logged_in' });
+      // Запускаем обработку snoozed чатов presale (fire-and-forget)
+      processPresaleSnoozed(adminItem.id);
+    } else {
+      res.status(200).json({ ok: true });
+    }
+    return;
+  }
+
+  // === ОРИГИНАЛЬНАЯ ЛОГИКА ДЛЯ conversation ===
+  const item = body.data?.item;
   if (!item) return res.status(200).json({ ok: true });
 
   const author = item.author;
@@ -145,5 +262,5 @@ app.post('/validate-email', async (req, res) => {
 app.head('/validate-email', (req, res) => res.status(200).send('OK'));
 
 app.listen(process.env.PORT || 3000, () => {
-  console.log('Webhook готов — с делеем');
+  console.log('Webhook готов — с делеем + presale unsnooze при логине агента');
 });
