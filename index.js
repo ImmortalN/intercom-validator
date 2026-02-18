@@ -51,7 +51,7 @@ async function addNoteWithDelay(conversationId, text, delay = DELAY_MS, adminId 
   }, delay);
 }
 
-// === ДОБАВЛЕНИЕ ТЕГА ===
+// === ДОБАВЛЕНИЕ ТЕГА (с admin_id) ===
 async function addTagToConversation(conversationId, tagName = PRESALE_FOLLOWUP_TAG) {
   if (!conversationId) {
     console.warn('[TAG] Нет conversationId');
@@ -59,10 +59,11 @@ async function addTagToConversation(conversationId, tagName = PRESALE_FOLLOWUP_T
   }
 
   try {
-    console.log(`[TAG ATTEMPT] Добавляем "${tagName}" в conv ${conversationId}`);
+    console.log(`[TAG ATTEMPT] "${tagName}" → conv ${conversationId} от admin ${ADMIN_ID}`);
 
-    const response = await axios.post(`https://api.intercom.io/conversations/${conversationId}/tags`, {
-      name: tagName
+    await axios.post(`https://api.intercom.io/conversations/${conversationId}/tags`, {
+      name: tagName,
+      admin_id: ADMIN_ID              // ← обязательно!
     }, {
       headers: {
         'Authorization': `Bearer ${INTERCOM_TOKEN}`,
@@ -73,23 +74,23 @@ async function addTagToConversation(conversationId, tagName = PRESALE_FOLLOWUP_T
       timeout: 8000
     });
 
-    console.log(`[TAG SUCCESS] "${tagName}" добавлен в ${conversationId}`, response.data);
+    console.log(`[TAG SUCCESS] "${tagName}" добавлен в ${conversationId}`);
   } catch (error) {
     if (error.response) {
       const status = error.response.status;
       const data = error.response.data;
 
-      if (status === 409 || (data?.errors?.[0]?.code === 'conflict')) {
-        console.log(`[TAG] "${tagName}" уже существует в ${conversationId}`);
-      } else if (status === 404) {
-        console.error(`[TAG FAIL 404] Conversation ${conversationId} не найдена`);
+      if (status === 409) {
+        console.log(`[TAG] "${tagName}" уже есть в ${conversationId}`);
       } else if (status === 403) {
-        console.error(`[TAG FAIL 403] Нет прав на добавление тегов для ADMIN_ID ${ADMIN_ID}`);
+        console.error(`[TAG 403] Нет прав у admin ${ADMIN_ID} на тегирование`);
+      } else if (status === 404) {
+        console.error(`[TAG 404] Conversation ${conversationId} не найдена`);
       } else {
         console.error(`[TAG FAIL ${status}] conv ${conversationId}:`, data || error.message);
       }
     } else {
-      console.error(`[TAG FAIL] conv ${conversationId}:`, error.message);
+      console.error(`[TAG NETWORK FAIL] ${conversationId}:`, error.message);
     }
   }
 }
@@ -155,7 +156,7 @@ async function processSnoozedForAdmin(adminId) {
         const cid = conv.id;
         await unsnoozeConversation(cid, adminId);
         await addNoteWithDelay(cid, PRESALE_NOTE_TEXT, 3000, ADMIN_ID);
-        // Добавляем тег сразу после заметки
+        // Добавляем тег после заметки
         await addTagToConversation(cid);
       }
 
@@ -168,7 +169,7 @@ async function processSnoozedForAdmin(adminId) {
   }
 }
 
-// === ОСНОВНАЯ ПРОВЕРКА (Unpaid + Subscription) ===
+// === ОСНОВНАЯ ПРОВЕРКА Subscription + Unpaid ===
 async function validateAndSetCustom(contactId, conversationId) {
   if (!contactId || !conversationId) return;
 
