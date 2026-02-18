@@ -13,7 +13,10 @@ const PRESALE_TEAM_ID = process.env.PRESALE_TEAM_ID;
 const PRESALE_NOTE_TEXT = process.env.PRESALE_NOTE_TEXT || 'Агент вийшов в онлайн — перевіряємо snoozed чати presale 😎';
 const INTERCOM_VERSION = '2.14';
 const DELAY_MS = 30000;
-const PRESALE_FOLLOWUP_TAG_ID = '13404165'; // ← знайдений ID тегу Presale FollowUp
+const PRESALE_FOLLOWUP_TAG_ID = '13404165';
+
+// Включаем/выключаем подробные логи через переменную окружения DEBUG (true/false)
+const DEBUG = process.env.DEBUG === 'true' || process.env.DEBUG === '1';
 
 // Глобальные Set'ы
 const processedConversations = new Set();
@@ -25,7 +28,22 @@ if (!INTERCOM_TOKEN || !LIST_URL || !ADMIN_ID) {
   process.exit(1);
 }
 
-// === ДОБАВЛЕНИЕ ЗАМЕТКИ (с делеем) ===
+console.log('Webhook запущен');
+console.log('DEBUG режим:', DEBUG ? 'включён (подробные логи)' : 'выключен');
+if (PRESALE_TEAM_ID) {
+  console.log(`Presale активна для команди: ${PRESALE_TEAM_ID}`);
+} else {
+  console.log('Presale вимкнена');
+}
+
+// === Удобная функция логирования (только если DEBUG=true) ===
+function log(...args) {
+  if (DEBUG) {
+    console.log(...args);
+  }
+}
+
+// === ДОБАВЛЕНИЕ ЗАМЕТКИ ===
 async function addNoteWithDelay(conversationId, text, delay = DELAY_MS, adminId = ADMIN_ID) {
   if (!conversationId) return;
 
@@ -44,26 +62,23 @@ async function addNoteWithDelay(conversationId, text, delay = DELAY_MS, adminId 
         },
         timeout: 6000
       });
-      console.log(`[NOTE] от ${adminId} (delay ${delay/1000}с): "${text.slice(0,60)}..." → ${conversationId}`);
+      log(`[NOTE] от ${adminId} (delay ${delay/1000}с): "${text.slice(0,60)}..." → ${conversationId}`);
     } catch (error) {
       console.error(`[NOTE FAIL] conv ${conversationId}:`, error.response?.data || error.message);
     }
   }, delay);
 }
 
-// === ДОБАВЛЕНИЕ ТЕГА (по ID + admin_id) ===
+// === ДОБАВЛЕНИЕ ТЕГА ===
 async function addTagToConversation(conversationId, tagId = PRESALE_FOLLOWUP_TAG_ID, adminId = ADMIN_ID) {
-  if (!conversationId) {
-    console.warn('[TAG] Нет conversationId');
-    return;
-  }
+  if (!conversationId) return;
 
   try {
-    console.log(`[TAG ATTEMPT] ID ${tagId} → conv ${conversationId} от admin ${adminId}`);
+    log(`[TAG ATTEMPT] ID ${tagId} → conv ${conversationId} от admin ${adminId}`);
 
     await axios.post(`https://api.intercom.io/conversations/${conversationId}/tags`, {
-      id: tagId,          // ← обязательно ID тега, а не имя
-      admin_id: adminId   // ← обязательно
+      id: tagId,
+      admin_id: adminId
     }, {
       headers: {
         'Authorization': `Bearer ${INTERCOM_TOKEN}`,
@@ -74,23 +89,19 @@ async function addTagToConversation(conversationId, tagId = PRESALE_FOLLOWUP_TAG
       timeout: 8000
     });
 
-    console.log(`[TAG SUCCESS] ID ${tagId} добавлен в ${conversationId}`);
+    log(`[TAG SUCCESS] ID ${tagId} добавлен в ${conversationId}`);
   } catch (error) {
     if (error.response) {
       const status = error.response.status;
       const data = error.response.data;
 
       if (status === 409) {
-        console.log(`[TAG] ID ${tagId} уже есть в ${conversationId}`);
-      } else if (status === 403) {
-        console.error(`[TAG 403] Нет прав у admin ${adminId} на тегирование`);
-      } else if (status === 404) {
-        console.error(`[TAG 404] Conversation ${conversationId} не найдена`);
+        log(`[TAG] ID ${tagId} уже есть в ${conversationId}`);
       } else {
         console.error(`[TAG FAIL ${status}] conv ${conversationId}:`, data || error.message);
       }
     } else {
-      console.error(`[TAG NETWORK FAIL] ${conversationId}:`, error.message);
+      console.error(`[TAG FAIL] ${conversationId}:`, error.message);
     }
   }
 }
@@ -111,7 +122,7 @@ async function unsnoozeConversation(conversationId, adminId = ADMIN_ID) {
       },
       timeout: 6000
     });
-    console.log(`[UNSNZ] от ${adminId}: ${conversationId}`);
+    log(`[UNSNZ] от ${adminId}: ${conversationId}`);
   } catch (error) {
     console.error(`[UNSNZ FAIL] ${conversationId}:`, error.response?.data || error.message);
   }
@@ -150,13 +161,12 @@ async function processSnoozedForAdmin(adminId) {
       });
 
       const convs = res.data.conversations || [];
-      console.log(`Presale: найдено ${convs.length} snoozed на странице ${page}`);
+      log(`Presale: найдено ${convs.length} snoozed на странице ${page}`);
 
       for (const conv of convs) {
         const cid = conv.id;
         await unsnoozeConversation(cid, adminId);
         await addNoteWithDelay(cid, PRESALE_NOTE_TEXT, 3000, ADMIN_ID);
-        // Добавляем тег после заметки
         await addTagToConversation(cid);
       }
 
@@ -291,5 +301,5 @@ app.post('/validate-email', async (req, res) => {
 app.head('/validate-email', (req, res) => res.status(200).send('OK'));
 
 app.listen(process.env.PORT || 3000, () => {
-  console.log('Webhook готов: Presale FollowUp тег (ID 13404165) + заметки');
+  console.log('Webhook готов: Presale FollowUp тег + заметки');
 });
