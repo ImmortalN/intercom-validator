@@ -13,7 +13,7 @@ const PRESALE_TEAM_ID = process.env.PRESALE_TEAM_ID;
 const PRESALE_NOTE_TEXT = process.env.PRESALE_NOTE_TEXT || 'Агент вийшов в онлайн — перевіряємо snoozed чати presale 😎';
 const INTERCOM_VERSION = '2.14';
 const DELAY_MS = 30000;
-const PRESALE_FOLLOWUP_TAG = 'Presale FollowUp';
+const PRESALE_FOLLOWUP_TAG_ID = '13404165'; // ← знайдений ID тегу Presale FollowUp
 
 // Глобальные Set'ы
 const processedConversations = new Set();
@@ -51,19 +51,19 @@ async function addNoteWithDelay(conversationId, text, delay = DELAY_MS, adminId 
   }, delay);
 }
 
-// === ДОБАВЛЕНИЕ ТЕГА (с admin_id) ===
-async function addTagToConversation(conversationId, tagName = PRESALE_FOLLOWUP_TAG) {
+// === ДОБАВЛЕНИЕ ТЕГА (по ID + admin_id) ===
+async function addTagToConversation(conversationId, tagId = PRESALE_FOLLOWUP_TAG_ID, adminId = ADMIN_ID) {
   if (!conversationId) {
     console.warn('[TAG] Нет conversationId');
     return;
   }
 
   try {
-    console.log(`[TAG ATTEMPT] "${tagName}" → conv ${conversationId} от admin ${ADMIN_ID}`);
+    console.log(`[TAG ATTEMPT] ID ${tagId} → conv ${conversationId} от admin ${adminId}`);
 
     await axios.post(`https://api.intercom.io/conversations/${conversationId}/tags`, {
-      name: tagName,
-      admin_id: ADMIN_ID              // ← обязательно!
+      id: tagId,          // ← обязательно ID тега, а не имя
+      admin_id: adminId   // ← обязательно
     }, {
       headers: {
         'Authorization': `Bearer ${INTERCOM_TOKEN}`,
@@ -74,16 +74,16 @@ async function addTagToConversation(conversationId, tagName = PRESALE_FOLLOWUP_T
       timeout: 8000
     });
 
-    console.log(`[TAG SUCCESS] "${tagName}" добавлен в ${conversationId}`);
+    console.log(`[TAG SUCCESS] ID ${tagId} добавлен в ${conversationId}`);
   } catch (error) {
     if (error.response) {
       const status = error.response.status;
       const data = error.response.data;
 
       if (status === 409) {
-        console.log(`[TAG] "${tagName}" уже есть в ${conversationId}`);
+        console.log(`[TAG] ID ${tagId} уже есть в ${conversationId}`);
       } else if (status === 403) {
-        console.error(`[TAG 403] Нет прав у admin ${ADMIN_ID} на тегирование`);
+        console.error(`[TAG 403] Нет прав у admin ${adminId} на тегирование`);
       } else if (status === 404) {
         console.error(`[TAG 404] Conversation ${conversationId} не найдена`);
       } else {
@@ -291,5 +291,5 @@ app.post('/validate-email', async (req, res) => {
 app.head('/validate-email', (req, res) => res.status(200).send('OK'));
 
 app.listen(process.env.PORT || 3000, () => {
-  console.log('Webhook готов: Presale FollowUp тег + заметки');
+  console.log('Webhook готов: Presale FollowUp тег (ID 13404165) + заметки');
 });
