@@ -13,11 +13,12 @@ const PRESALE_TEAM_ID = process.env.PRESALE_TEAM_ID;
 const PRESALE_NOTE_TEXT = process.env.PRESALE_NOTE_TEXT || 'Агент вийшов в онлайн — перевіряємо snoozed чати presale 😎';
 const INTERCOM_VERSION = '2.14';
 const DELAY_MS = 30000;
+const PRESALE_FOLLOWUP_TAG = 'Presale FollowUp'; // тег, який додаємо
 
-// Глобальні Set'и — чітко розділені
-const processedUnpaidConversations = new Set();       // тільки Unpaid Custom
-const processedSubscriptionConversations = new Set(); // тільки Subscription
-const processedTransferConversations = new Set();     // тільки передача з бота
+// Глобальні Set'и
+const processedConversations = new Set();               // Unpaid Custom
+const processedSubscriptionConversations = new Set();   // Subscription
+const processedTransferConversations = new Set();       // передача з бота
 
 if (!INTERCOM_TOKEN || !LIST_URL || !ADMIN_ID) {
   console.error('ОШИБКА: INTERCOM_TOKEN, LIST_URL або ADMIN_ID не задані!');
@@ -33,7 +34,7 @@ if (PRESALE_TEAM_ID) {
 
 // === ДОДАВАННЯ НОТАТКИ ===
 async function addNoteWithDelay(conversationId, text, delay = DELAY_MS, adminId = ADMIN_ID) {
-  if (!conversationId) return console.warn('addNoteWithDelay: немає conversationId');
+  if (!conversationId) return;
 
   setTimeout(async () => {
     try {
@@ -50,11 +51,38 @@ async function addNoteWithDelay(conversationId, text, delay = DELAY_MS, adminId 
         },
         timeout: 6000
       });
-      console.log(`[NOTE OK] від ${adminId} (delay ${delay/1000}с): "${text.slice(0,60)}..." → ${conversationId}`);
+      console.log(`[NOTE] від ${adminId} (delay ${delay/1000}с): "${text.slice(0,60)}..." → ${conversationId}`);
     } catch (error) {
       console.error(`[NOTE FAIL] conv ${conversationId}:`, error.response?.data || error.message);
     }
   }, delay);
+}
+
+// === ДОДАВАННЯ ТЕГУ ===
+async function addTagToConversation(conversationId, tagName = PRESALE_FOLLOWUP_TAG) {
+  if (!conversationId) return;
+
+  try {
+    await axios.post(`https://api.intercom.io/conversations/${conversationId}/tags`, {
+      name: tagName
+    }, {
+      headers: {
+        'Authorization': `Bearer ${INTERCOM_TOKEN}`,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'Intercom-Version': INTERCOM_VERSION
+      },
+      timeout: 6000
+    });
+    console.log(`[TAG] "${tagName}" додано до ${conversationId}`);
+  } catch (error) {
+    // Якщо тег вже існує — Intercom повертає 409, це нормально
+    if (error.response?.status === 409) {
+      console.log(`[TAG] "${tagName}" вже є в ${conversationId}`);
+    } else {
+      console.error(`[TAG FAIL] ${conversationId}:`, error.response?.data || error.message);
+    }
+  }
 }
 
 // === UNSNOOZE (тільки presale) ===
@@ -73,7 +101,7 @@ async function unsnoozeConversation(conversationId, adminId = ADMIN_ID) {
       },
       timeout: 6000
     });
-    console.log(`[UNSNZ OK] від ${adminId}: ${conversationId}`);
+    console.log(`[UNSNZ] від ${adminId}: ${conversationId}`);
   } catch (error) {
     console.error(`[UNSNZ FAIL] ${conversationId}:`, error.response?.data || error.message);
   }
@@ -81,7 +109,7 @@ async function unsnoozeConversation(conversationId, adminId = ADMIN_ID) {
 
 // === PRESALE: обробка snoozed ===
 async function processSnoozedForAdmin(adminId) {
-  if (!PRESALE_TEAM_ID || !adminId) return console.log('Presale вимкнена або немає adminId');
+  if (!PRESALE_TEAM_ID || !adminId) return;
 
   try {
     let startingAfter = null;
@@ -117,7 +145,8 @@ async function processSnoozedForAdmin(adminId) {
       for (const conv of convs) {
         const cid = conv.id;
         await unsnoozeConversation(cid, adminId);
-        await addNoteWithDelay(cid, PRESALE_NOTE_TEXT, 3000, ADMIN_ID);
+        await addNoteWithDelay(cid, PRESALE_NOTE_TEXT, 3000, ADMIN_ID); // фіксований системний admin
+        await addTagToConversation(cid); // додаємо тег Presale FollowUp
       }
 
       startingAfter = res.data.pages?.next?.starting_after;
@@ -125,20 +154,15 @@ async function processSnoozedForAdmin(adminId) {
       await new Promise(r => setTimeout(r, 1200));
     } while (startingAfter);
   } catch (e) {
-    console.error('Помилка processSnoozedForAdmin:', e.response?.data || e.message);
+    console.error('[PRESALE ERROR]:', e.response?.data || e.message);
   }
 }
 
 // === ОСНОВНА ПЕРЕВІРКА Subscription + Unpaid ===
 async function validateAndSetCustom(contactId, conversationId) {
-  if (!contactId || !conversationId) {
-    console.warn(`validate пропущено: contact ${contactId || 'немає'}, conv ${conversationId || 'немає'}`);
-    return;
-  }
+  if (!contactId || !conversationId) return;
 
   try {
-    console.log(`[VALIDATE] Початок перевірки для contact ${contactId}, conv ${conversationId}`);
-
     const contactRes = await axios.get(`https://api.intercom.io/contacts/${contactId}`, {
       headers: {
         'Authorization': `Bearer ${INTERCOM_TOKEN}`,
@@ -155,30 +179,29 @@ async function validateAndSetCustom(contactId, conversationId) {
     const emails = [
       contact.email,
       contact.custom_attributes?.['Purchase email']
-    ].filter(e => e && e.includes('@'));
+    ].filter(Boolean);
 
     // Unpaid Custom
     if (emails.length > 0) {
       const { data: emailList } = await axios.get(LIST_URL, { timeout: 5000 });
       if (Array.isArray(emailList)) {
         const isMatch = emails.some(e => 
-          emailList.some(le => le?.trim?.().toLowerCase() === e.trim().toLowerCase())
+          emailList.some(le => (le || '').trim().toLowerCase() === e.trim().toLowerCase())
         );
 
-        if (isMatch && !processedUnpaidConversations.has(conversationId)) {
-          processedUnpaidConversations.add(conversationId);
+        if (isMatch && !processedConversations.has(conversationId)) {
+          processedConversations.add(conversationId);
           await addNoteWithDelay(conversationId, 'Attention!!! Клиент не заплатил за кастом - саппорт не предоставляем', 5000);
         }
       }
     }
 
-    // Subscription — незалежно від всього
+    // Subscription + тег тільки якщо нотатку додали
     if (isEmptySubscription && !processedSubscriptionConversations.has(conversationId)) {
-      console.log(`[SUBS] Порожнє поле Subscription → додаємо нотатку в ${conversationId}`);
       processedSubscriptionConversations.add(conversationId);
       await addNoteWithDelay(conversationId, 'Заповніть будь ласка subscription 😇🙏', 10000);
-    } else if (!isEmptySubscription) {
-      console.log(`[SUBS] Поле Subscription заповнене: "${subscription}"`);
+      // Тег додаємо тільки при subscription-нотатці, якщо потрібно
+      // await addTagToConversation(conversationId); // раскомменти, якщо хочеш тег і тут
     }
 
   } catch (e) {
@@ -192,33 +215,25 @@ app.post('/validate-email', async (req, res) => {
   const topic = body.topic;
   const item = body.data?.item;
 
-  if (!item) {
-    console.log('Webhook без item → OK');
-    return res.status(200).json({ ok: true });
-  }
+  if (!item) return res.status(200).json({ ok: true });
 
   const conversationId = item.id;
   let contactId = item.contacts?.contacts?.[0]?.id || item.author?.id;
 
-  console.log(`[WEBHOOK] topic: ${topic || 'без topic'}, conv: ${conversationId || '?'}, contact: ${contactId || '?'}`);
-
-  // 1. PRESALE тільки
+  // PRESALE (unsnooze + presale-нотатка + тег)
   if (topic === 'admin.away_mode_updated' && item?.type === 'admin') {
     const adminId = item.id;
     const awayEnabled = item.away_mode_enabled;
-    console.log(`[AWAY] ${item.name || item.email} (${adminId}) → away: ${awayEnabled}`);
-
     if (!awayEnabled) processSnoozedForAdmin(adminId);
     return res.status(200).json({ ok: true });
   }
 
   if (topic === 'admin.logged_in' && item?.id) {
-    console.log(`[LOGIN] ${item.name || item.email} (${item.id})`);
     processSnoozedForAdmin(item.id);
     return res.status(200).json({ ok: true });
   }
 
-  // 2. Передача з бота → команда
+  // Передача з бота → команда
   if (topic === 'conversation.admin.assigned') {
     const prev = item.previous_assignee || (item.conversation_parts?.conversation_parts?.[0]?.assignee);
     const assignee = item.assignee;
@@ -227,30 +242,22 @@ app.post('/validate-email', async (req, res) => {
       (prev?.type === 'bot' || (prev?.type === 'admin' && (prev.id || '').startsWith('bot_'))) &&
       assignee?.type === 'team';
 
-    console.log(`[ASSIGNED] ${conversationId} | prev: ${prev?.type || '—'}, new: ${assignee?.type || '—'}`);
-
     if (isTransferFromBot && !processedTransferConversations.has(conversationId)) {
       processedTransferConversations.add(conversationId);
       await addNoteWithDelay(conversationId, 'Чат передано з бота на команду presale/support', 5000);
     }
 
-    // Перевірка Subscription + Unpaid завжди
-    if (contactId && conversationId) {
-      await validateAndSetCustom(contactId, conversationId);
-    }
+    if (contactId && conversationId) await validateAndSetCustom(contactId, conversationId);
     return res.status(200).json({ ok: true });
   }
 
-  // 3. Клієнт пише → найважливіший тригер для Subscription
+  // Клієнт пише — ключовий тригер для Subscription
   if (topic === 'conversation.user.replied') {
-    console.log(`[USER REPLY] conv ${conversationId}`);
-    if (contactId && conversationId) {
-      await validateAndSetCustom(contactId, conversationId);
-    }
+    if (contactId && conversationId) await validateAndSetCustom(contactId, conversationId);
     return res.status(200).json({ ok: true });
   }
 
-  // 4. Звичайний webhook (як в оригіналі)
+  // Звичайний webhook
   const author = item.author;
   if (
     author?.type === 'bot' ||
@@ -261,13 +268,11 @@ app.post('/validate-email', async (req, res) => {
     return res.status(200).json({ skipped: 'bot' });
   }
 
-  if (conversationId && (processedUnpaidConversations.has(conversationId) || processedSubscriptionConversations.has(conversationId))) {
-    console.log(`[SKIP] чат ${conversationId} вже оброблено`);
+  if (conversationId && (processedConversations.has(conversationId) || processedSubscriptionConversations.has(conversationId))) {
     return res.status(200).json({ skipped: 'already_processed' });
   }
 
   if (contactId && conversationId) {
-    console.log(`[ОБРОБКА] звичайний чат ${conversationId} (contact ${contactId})`);
     await validateAndSetCustom(contactId, conversationId);
   }
 
@@ -277,6 +282,5 @@ app.post('/validate-email', async (req, res) => {
 app.head('/validate-email', (req, res) => res.status(200).send('OK'));
 
 app.listen(process.env.PORT || 3000, () => {
-  console.log('Webhook запущено на порту', process.env.PORT || 3000);
-  console.log('Підписка на події: conversation.user.replied, conversation.admin.assigned, admin.away_mode_updated, admin.logged_in');
+  console.log('Webhook готовий: Subscription + Presale FollowUp tag');
 });
