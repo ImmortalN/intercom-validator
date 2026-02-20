@@ -14,8 +14,9 @@ const PRESALE_NOTE_TEXT = process.env.PRESALE_NOTE_TEXT || 'Агент вийш�
 const INTERCOM_VERSION = '2.14';
 const DELAY_MS = 30000;
 const PRESALE_FOLLOWUP_TAG_ID = '13404165';
+const FOLLOW_UP_ATTR = 'Follow-Up';  // ← назва атрибута conversation
 
-// Включаем/выключаем подробные логи через переменную окружения DEBUG (true/false)
+// Включаем/выключаем подробные логи
 const DEBUG = process.env.DEBUG === 'true' || process.env.DEBUG === '1';
 
 // Глобальные Set'ы
@@ -36,7 +37,7 @@ if (PRESALE_TEAM_ID) {
   console.log('Presale вимкнена');
 }
 
-// === Удобная функция логирования (только если DEBUG=true) ===
+// === Удобная функция логирования ===
 function log(...args) {
   if (DEBUG) {
     console.log(...args);
@@ -46,7 +47,6 @@ function log(...args) {
 // === ДОБАВЛЕНИЕ ЗАМЕТКИ ===
 async function addNoteWithDelay(conversationId, text, delay = DELAY_MS, adminId = ADMIN_ID) {
   if (!conversationId) return;
-
   setTimeout(async () => {
     try {
       await axios.post(`https://api.intercom.io/conversations/${conversationId}/reply`, {
@@ -72,10 +72,8 @@ async function addNoteWithDelay(conversationId, text, delay = DELAY_MS, adminId 
 // === ДОБАВЛЕНИЕ ТЕГА ===
 async function addTagToConversation(conversationId, tagId = PRESALE_FOLLOWUP_TAG_ID, adminId = ADMIN_ID) {
   if (!conversationId) return;
-
   try {
     log(`[TAG ATTEMPT] ID ${tagId} → conv ${conversationId} от admin ${adminId}`);
-
     await axios.post(`https://api.intercom.io/conversations/${conversationId}/tags`, {
       id: tagId,
       admin_id: adminId
@@ -88,13 +86,11 @@ async function addTagToConversation(conversationId, tagId = PRESALE_FOLLOWUP_TAG
       },
       timeout: 8000
     });
-
     log(`[TAG SUCCESS] ID ${tagId} добавлен в ${conversationId}`);
   } catch (error) {
     if (error.response) {
       const status = error.response.status;
       const data = error.response.data;
-
       if (status === 409) {
         log(`[TAG] ID ${tagId} уже есть в ${conversationId}`);
       } else {
@@ -128,7 +124,28 @@ async function unsnoozeConversation(conversationId, adminId = ADMIN_ID) {
   }
 }
 
-// === PRESALE: обработка snoozed ===
+// === ПРОВЕРКА Follow-Up атрибута ===
+async function isFollowUpBlocked(conversationId) {
+  if (!conversationId) return false;
+  try {
+    const res = await axios.get(`https://api.intercom.io/conversations/${conversationId}`, {
+      headers: {
+        'Authorization': `Bearer ${INTERCOM_TOKEN}`,
+        'Accept': 'application/json',
+        'Intercom-Version': INTERCOM_VERSION
+      },
+      timeout: 8000
+    });
+    const value = res.data.custom_attributes?.[FOLLOW_UP_ATTR];
+    log(`[FOLLOW-UP CHECK] ${conversationId} → ${FOLLOW_UP_ATTR} = ${value}`);
+    return value === true;
+  } catch (error) {
+    console.error(`[FOLLOW-UP ATTR ERROR] ${conversationId}:`, error.response?.data || error.message);
+    return false; // якщо помилка — не блокуємо, щоб не зупиняти presale
+  }
+}
+
+// === PRESALE: обробка snoozed ===
 async function processSnoozedForAdmin(adminId) {
   if (!PRESALE_TEAM_ID || !adminId) return;
 
@@ -161,10 +178,19 @@ async function processSnoozedForAdmin(adminId) {
       });
 
       const convs = res.data.conversations || [];
-      log(`Presale: найдено ${convs.length} snoozed на странице ${page}`);
+      log(`Presale: знайдено ${convs.length} snoozed на сторінці ${page}`);
 
       for (const conv of convs) {
         const cid = conv.id;
+
+        // Перевірка блокуючого атрибута
+        const blocked = await isFollowUpBlocked(cid);
+        if (blocked) {
+          log(`[SKIP PRESALE] conv ${cid} — ${FOLLOW_UP_ATTR} = true`);
+          continue;
+        }
+
+        // Якщо не заблоковано — виконуємо дії
         await unsnoozeConversation(cid, adminId);
         await addNoteWithDelay(cid, PRESALE_NOTE_TEXT, 3000, ADMIN_ID);
         await addTagToConversation(cid);
@@ -174,12 +200,13 @@ async function processSnoozedForAdmin(adminId) {
       page++;
       await new Promise(r => setTimeout(r, 1200));
     } while (startingAfter);
+
   } catch (e) {
     console.error('[PRESALE ERROR]:', e.response?.data || e.message);
   }
 }
 
-// === ОСНОВНАЯ ПРОВЕРКА Subscription + Unpaid ===
+// === ОСНОВНА ПРОВЕРКА Subscription + Unpaid ===
 async function validateAndSetCustom(contactId, conversationId) {
   if (!contactId || !conversationId) return;
 
@@ -206,7 +233,7 @@ async function validateAndSetCustom(contactId, conversationId) {
     if (emails.length > 0) {
       const { data: emailList } = await axios.get(LIST_URL, { timeout: 5000 });
       if (Array.isArray(emailList)) {
-        const isMatch = emails.some(e => 
+        const isMatch = emails.some(e =>
           emailList.some(le => (le || '').trim().toLowerCase() === e.trim().toLowerCase())
         );
 
@@ -239,7 +266,7 @@ app.post('/validate-email', async (req, res) => {
   const conversationId = item.id;
   let contactId = item.contacts?.contacts?.[0]?.id || item.author?.id;
 
-  // PRESALE
+  // PRESALE: адмін вийшов з away або залогінився
   if (topic === 'admin.away_mode_updated' && item?.type === 'admin') {
     const adminId = item.id;
     const awayEnabled = item.away_mode_enabled;
@@ -252,12 +279,12 @@ app.post('/validate-email', async (req, res) => {
     return res.status(200).json({ ok: true });
   }
 
-  // Передача с бота
+  // Передача з бота
   if (topic === 'conversation.admin.assigned') {
     const prev = item.previous_assignee || (item.conversation_parts?.conversation_parts?.[0]?.assignee);
     const assignee = item.assignee;
 
-    const isTransferFromBot = 
+    const isTransferFromBot =
       (prev?.type === 'bot' || (prev?.type === 'admin' && (prev.id || '').startsWith('bot_'))) &&
       assignee?.type === 'team';
 
@@ -276,7 +303,7 @@ app.post('/validate-email', async (req, res) => {
     return res.status(200).json({ ok: true });
   }
 
-  // Обычный webhook
+  // Обычный webhook (fallback)
   const author = item.author;
   if (
     author?.type === 'bot' ||
@@ -301,5 +328,5 @@ app.post('/validate-email', async (req, res) => {
 app.head('/validate-email', (req, res) => res.status(200).send('OK'));
 
 app.listen(process.env.PORT || 3000, () => {
-  console.log('Webhook готов: Presale FollowUp тег + заметки');
+  console.log('Webhook готов: Presale FollowUp тег + заметки + перевірка Follow-Up атрибута');
 });
