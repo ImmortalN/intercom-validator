@@ -198,26 +198,35 @@ async function validateAndSetCustom(contactId, conversationId) {
         // Перевірка Unpaid Custom
         if (emails.length > 0) {
             const { data: emailList } = await axios.get(LIST_URL, { timeout: 5000 });
+            
             if (Array.isArray(emailList)) {
-                const isMatch = emails.some(e =>
+                const shouldBeUnpaid = emails.some(e =>
                     emailList.some(le => (le || '').trim().toLowerCase() === e.trim().toLowerCase())
                 );
 
-                if (isMatch && !processedConversations.has(conversationId)) {
-                    processedConversations.add(conversationId);
+                // Визначаємо, яким має бути значення атрибута
+                const desiredValue = shouldBeUnpaid ? true : null;
+
+                // Перевіряємо, чи потрібно оновлювати (щоб не робити зайвих запитів)
+                const currentValue = currentUnpaidStatus === true ? true : null;
+                
+                if (desiredValue !== currentValue) {
+                    await updateContactAttribute(contactId, { [CUSTOM_ATTR_NAME]: desiredValue });
                     
-                    // Додаємо нотатку
-                    await addNoteWithDelay(conversationId, 'Attention!!! Клиент не заплатил за кастом - саппорт не предоставляем', 5000);
-                    
-                    // ОНОВЛЮЄМО АТРИБУТ (якщо він ще не true)
-                    if (currentUnpaidStatus !== true) {
-                        await updateContactAttribute(contactId, { [CUSTOM_ATTR_NAME]: true });
+                    // Додаємо нотатку ТІЛЬКИ якщо стали неплатником (true) і вперше
+                    if (shouldBeUnpaid && !processedConversations.has(conversationId)) {
+                        processedConversations.add(conversationId);
+                        await addNoteWithDelay(
+                            conversationId,
+                            'Attention!!! Клиент не заплатил за кастом - саппорт не предоставляем',
+                            5000
+                        );
                     }
                 }
             }
         }
 
-        // Перевірка Subscription
+        // Перевірка Subscription (без змін)
         if (!subscription.trim() && !processedSubscriptionConversations.has(conversationId)) {
             processedSubscriptionConversations.add(conversationId);
             await addNoteWithDelay(conversationId, 'Заповніть будь ласка subscription 😇🙏', 10000);
