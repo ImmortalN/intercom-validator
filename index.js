@@ -17,7 +17,7 @@ const FOLLOW_UP_ATTR = 'Follow-Up';
 
 const DEBUG = process.env.DEBUG === 'true' || process.env.DEBUG === '1';
 
-const processedConversations = new Set();
+const processedConversations = new Set();               // можна залишити, але вже не використовується для unpaid
 const processedSubscriptionConversations = new Set();
 const processedTransferConversations = new Set();
 
@@ -195,38 +195,22 @@ async function validateAndSetCustom(contactId, conversationId) {
             contact.custom_attributes?.['Purchase email']
         ].filter(Boolean);
 
-        // Перевірка Unpaid Custom
+        // Перевірка Unpaid Custom — ТІЛЬКИ атрибут, без нотатки
         if (emails.length > 0) {
             const { data: emailList } = await axios.get(LIST_URL, { timeout: 5000 });
-            
+           
             if (Array.isArray(emailList)) {
-                const shouldBeUnpaid = emails.some(e =>
+                const isMatch = emails.some(e =>
                     emailList.some(le => (le || '').trim().toLowerCase() === e.trim().toLowerCase())
                 );
 
-                // Визначаємо, яким має бути значення атрибута
-                const desiredValue = shouldBeUnpaid ? true : null;
-
-                // Перевіряємо, чи потрібно оновлювати (щоб не робити зайвих запитів)
-                const currentValue = currentUnpaidStatus === true ? true : null;
-                
-                if (desiredValue !== currentValue) {
-                    await updateContactAttribute(contactId, { [CUSTOM_ATTR_NAME]: desiredValue });
-                    
-                    // Додаємо нотатку ТІЛЬКИ якщо стали неплатником (true) і вперше
-                    if (shouldBeUnpaid && !processedConversations.has(conversationId)) {
-                        processedConversations.add(conversationId);
-                        await addNoteWithDelay(
-                            conversationId,
-                            'Attention!!! Клиент не заплатил за кастом - саппорт не предоставляем',
-                            5000
-                        );
-                    }
+                if (isMatch && currentUnpaidStatus !== true) {
+                    await updateContactAttribute(contactId, { [CUSTOM_ATTR_NAME]: true });
                 }
             }
         }
 
-        // Перевірка Subscription (без змін)
+        // Перевірка Subscription — без змін
         if (!subscription.trim() && !processedSubscriptionConversations.has(conversationId)) {
             processedSubscriptionConversations.add(conversationId);
             await addNoteWithDelay(conversationId, 'Заповніть будь ласка subscription 😇🙏', 10000);
@@ -285,5 +269,5 @@ app.post('/validate-email', async (req, res) => {
 app.head('/validate-email', (req, res) => res.status(200).send('OK'));
 
 app.listen(process.env.PORT || 3000, () => {
-    console.log('Webhook активний: перевірка Unpaid Custom + Subscription');
+    console.log('Webhook активний: перевірка Unpaid Custom + Subscription (без нотатки про неоплату кастому)');
 });
