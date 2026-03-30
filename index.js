@@ -3,57 +3,49 @@ const axios = require('axios');
 const app = express();
 app.use(express.json());
 
+// === ПЕРЕМЕННЫЕ ===
 const INTERCOM_TOKEN = process.env.INTERCOM_TOKEN;
-const WORKER_URL = process.env.WORKER_URL;
+const LIST_URL = process.env.LIST_URL;
+const CUSTOM_ATTR_NAME = process.env.CUSTOM_ATTR_NAME || 'User exists'; // можно поменять на 'Unpaid Custom'
 const INTERCOM_VERSION = '2.14';
 const DEBUG = process.env.DEBUG === 'true' || process.env.DEBUG === '1';
 
+if (!INTERCOM_TOKEN || !LIST_URL) {
+    console.error('❌ ОШИБКА: INTERCOM_TOKEN и LIST_URL обязательны!');
+    process.exit(1);
+}
+
 function log(...args) {
-    if (DEBUG) console.log(`[LOG]`, ...args);
+    if (DEBUG) console.log('[LOG]', ...args);
 }
 
-// === ПРОВЕРКА ПЕРЕМЕННЫХ ПРИ СТАРТЕ СЕРВЕРА (а не сразу) ===
-function checkEnv() {
-    if (!INTERCOM_TOKEN) {
-        console.error('❌ ОШИБКА: INTERCOM_TOKEN не задан!');
-        process.exit(1);
-    }
-    if (!WORKER_URL) {
-        console.error('❌ ОШИБКА: WORKER_URL не задан!');
-        process.exit(1);
-    }
-    console.log('✅ Переменные окружения загружены успешно');
-}
-
-checkEnv(); // проверяем только когда запускается сервер
-
-// =============================================
-
-async function getVerificationFromWorker(email) {
-    if (!email) return { exists: false, valid: false };
-
+// === ПРОВЕРКА EMAIL В СПИСКЕ ===
+async function isEmailInUnpaidList(email) {
+    if (!email) return false;
     try {
-        log(`Отправляю запрос воркеру для: ${email}`);
-        const url = WORKER_URL.includes('?') 
-            ? `${WORKER_URL}${encodeURIComponent(email)}` 
-            : `${WORKER_URL}?email=${encodeURIComponent(email)}`;
+        const { data: emailList } = await axios.get(LIST_URL, { timeout: 10000 });
+        
+        if (!Array.isArray(emailList)) {
+            log('LIST_URL вернул не массив');
+            return false;
+        }
 
-        const res = await axios.get(url, { timeout: 10000 });
-        return {
-            exists: res.data.exists === true,
-            valid: res.data.valid === true
-        };
+        const normalizedEmail = email.trim().toLowerCase();
+        return emailList.some(listEmail => 
+            (listEmail || '').trim().toLowerCase() === normalizedEmail
+        );
     } catch (e) {
-        log(`Ошибка воркера (${email}):`, e.message);
-        return { exists: false, valid: false };
+        log(`Ошибка при запросе LIST_URL:`, e.message);
+        return false;
     }
 }
 
+// === ОСНОВНАЯ ПРОВЕРКА КОНТАКТА ===
 async function verifyContact(contactId) {
     if (!contactId) return;
 
     try {
-        log(`--- Начинаю проверку контакта ${contactId} ---`);
+        log(`--- Проверка контакта ${contactId} ---`);
 
         const contactRes = await axios.get(`https://api.intercom.io/contacts/${contactId}`, {
             headers: {
@@ -66,43 +58,36 @@ async function verifyContact(contactId) {
         const contact = contactRes.data;
         const attrs = contact.custom_attributes || {};
 
-        log(`Все кастомные атрибуты:`, JSON.stringify(attrs));
-
         // Защита от повторной проверки
-        if (attrs['User exists'] !== null && attrs['User exists'] !== undefined) {
-            log(`Контакт уже проверен (User exists = ${attrs['User exists']}). Пропускаю.`);
+        if (attrs[CUSTOM_ATTR_NAME] !== undefined) {
+            log(`Контакт уже проверен (${CUSTOM_ATTR_NAME} = ${attrs[CUSTOM_ATTR_NAME]}). Пропускаем.`);
             return;
         }
 
-        const defaultEmail = contact.email;
-        const purchaseEmail = attrs['Purchase Email'] ||
-                             attrs['Purchase email'] ||
-                             attrs['purchase_email'] ||
-                             attrs['purchase email'];
+        // Собираем все возможные email
+        const emailsToCheck = [
+            contact.email,
+            attrs['Purchase Email'],
+            attrs['Purchase email'],
+            attrs['purchase_email'],
+            attrs['purchase email']
+        ].filter(Boolean);
 
-        log(`Найденные имейлы: Default=${defaultEmail || 'нет'}, Purchase=${purchaseEmail || 'нет'}`);
+        log(`Emails для проверки:`, emailsToCheck);
 
-        let finalResult = { exists: false, valid: false };
-
-        // Проверка 1 — Default Email
-        if (defaultEmail) {
-            log(`Шаг 1: Проверяю Default Email...`);
-            finalResult = await getVerificationFromWorker(defaultEmail);
+        let isUnpaid = false;
+        for (const email of emailsToCheck) {
+            if (await isEmailInUnpaidList(email)) {
+                isUnpaid = true;
+                log(`Найден в списке неоплаченных: ${email}`);
+                break;
+            }
         }
 
-        // Проверка 2 — Purchase Email (только если по default не нашли)
-        if (!finalResult.exists && purchaseEmail) {
-            log(`Шаг 2: Default не найден. Проверяю Purchase Email: ${purchaseEmail}`);
-            finalResult = await getVerificationFromWorker(purchaseEmail);
-        } else if (!purchaseEmail) {
-            log(`Шаг 2: Purchase Email не найден в профиле.`);
-        }
-
-        // Обновляем атрибуты
+        // Обновляем атрибут в Intercom
         await axios.put(`https://api.intercom.io/contacts/${contactId}`, {
             custom_attributes: {
-                'User exists': finalResult.exists,
-                'Has active subscription': finalResult.valid
+                [CUSTOM_ATTR_NAME]: isUnpaid
             }
         }, {
             headers: {
@@ -112,18 +97,17 @@ async function verifyContact(contactId) {
             }
         });
 
-        console.log(`✅ Успешно обновлено для контакта ${contactId}`);
+        console.log(`✅ Контакт ${contactId} обновлён → ${CUSTOM_ATTR_NAME} = ${isUnpaid}`);
     } catch (e) {
-        console.error(`❌ Ошибка в verifyContact для ${contactId}:`, e.response?.data || e.message);
+        console.error(`❌ Ошибка при проверке контакта ${contactId}:`, e.response?.data || e.message);
     }
 }
 
 // ===================== WEBHOOK =====================
 app.post('/validate-email', (req, res) => {
-    res.status(200).json({ ok: true });   // сразу отвечаем Render/Intercom
+    res.status(200).json({ ok: true }); // сразу отвечаем
 
-    const body = req.body;
-    const item = body.data?.item;
+    const item = req.body.data?.item;
     if (!item) return;
 
     const contactId = item.user?.id ||
@@ -132,18 +116,17 @@ app.post('/validate-email', (req, res) => {
                       (item.type === 'contact' ? item.id : null);
 
     if (contactId) {
-        log(`Webhook получен: ${body.topic} → contact ${contactId}`);
-        // запускаем проверку асинхронно
-        verifyContact(contactId);
+        log(`Webhook: ${req.body.topic} → contact ${contactId}`);
+        verifyContact(contactId); // асинхронно
     }
 });
 
-app.get('/', (req, res) => res.send('Verifier v5.1 is running ✅'));
+app.get('/', (req, res) => res.send('✅ Unpaid Custom Verifier is running'));
 
 // ===================== START =====================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log(`🚀 Verifier запущен на порту ${PORT}`);
-    console.log(`   Intercom Version: ${INTERCOM_VERSION}`);
-    console.log(`   Worker URL: ${WORKER_URL}`);
+    console.log(`🚀 Сервер запущен на порту ${PORT}`);
+    console.log(`   LIST_URL подключён: ${LIST_URL}`);
+    console.log(`   Атрибут: ${CUSTOM_ATTR_NAME}`);
 });
