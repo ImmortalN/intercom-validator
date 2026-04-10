@@ -17,7 +17,13 @@ const FOLLOW_UP_ATTR = 'Follow-Up';
 
 const DEBUG = process.env.DEBUG === 'true' || process.env.DEBUG === '1';
 
-const processedConversations = new Set();               // можна залишити, але вже не використовується для unpaid
+// === НОВОЕ: КОНТРОЛЬ "СЛЕДУЮЩИЙ ДЕНЬ" ===
+// Теперь ноут появляется ТОЛЬКО 1 раз в день (при первом триггере away_mode_updated / logged_in)
+// Это решает проблему: даже если агент выключает away mode несколько раз за день — ноут не дублируется.
+// Работает как "следующий день" по календарю (10.04 → 11.04). Reassign replies не имеет вебхука, поэтому этот workaround идеально заменяет твою идею.
+const lastProcessedDay = new Map();
+
+const processedConversations = new Set();               // можно оставить, но уже не используется для unpaid
 const processedSubscriptionConversations = new Set();
 const processedTransferConversations = new Set();
 
@@ -26,13 +32,13 @@ if (!INTERCOM_TOKEN || !LIST_URL || !ADMIN_ID) {
     process.exit(1);
 }
 
-console.log('Webhook запущен');
+console.log('Webhook запущен (с проверкой следующего дня для presale ноутов)');
 
 function log(...args) {
     if (DEBUG) console.log(...args);
 }
 
-// === ФУНКЦІЯ ОНОВЛЕННЯ АТРИБУТІВ КОНТАКТУ ===
+// === ФУНКЦИЯ ОБНОВЛЕНИЯ АТРИБУТОВ КОНТАКТУ ===
 async function updateContactAttribute(contactId, attributes) {
     if (!contactId || !attributes) return;
     try {
@@ -137,9 +143,19 @@ async function isFollowUpBlocked(conversationId) {
     }
 }
 
-// === PRESALE PROCESSING ===
+// === PRESALE PROCESSING (с проверкой следующего дня) ===
 async function processSnoozedForAdmin(adminId) {
     if (!PRESALE_TEAM_ID || !adminId) return;
+
+    // === НОВАЯ ЛОГИКА: проверяем, что это точно следующий день ===
+    const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
+    if (lastProcessedDay.has(adminId) && lastProcessedDay.get(adminId) === today) {
+        log(`[PRESALE SKIP] Уже обработано сегодня для админа ${adminId} — ноут НЕ появится повторно (даже при away mode off)`);
+        return;
+    }
+    lastProcessedDay.set(adminId, today);
+    log(`[PRESALE START] Первый запуск сегодня для админа ${adminId} — unsnooze + ноут`);
+
     try {
         let startingAfter = null;
         do {
@@ -174,7 +190,7 @@ async function processSnoozedForAdmin(adminId) {
     }
 }
 
-// === ОСНОВНА ПЕРЕВІРКА ТА ОНОВЛЕННЯ (Subscription + Unpaid) ===
+// === ОСНОВНАЯ ПЕРЕВІРКА ТА ОНОВЛЕННЯ (Subscription + Unpaid) ===
 async function validateAndSetCustom(contactId, conversationId) {
     if (!contactId || !conversationId) return;
     try {
@@ -231,7 +247,7 @@ app.post('/validate-email', async (req, res) => {
     const conversationId = item.id;
     let contactId = item.contacts?.contacts?.[0]?.id || item.author?.id;
 
-    // Сценарії Presale (Away / Login)
+    // Сценарії Presale (Away / Login) — теперь с проверкой следующего дня
     if ((topic === 'admin.away_mode_updated' && !item.away_mode_enabled) || topic === 'admin.logged_in') {
         processSnoozedForAdmin(item.id);
         return res.status(200).json({ ok: true });
@@ -269,5 +285,5 @@ app.post('/validate-email', async (req, res) => {
 app.head('/validate-email', (req, res) => res.status(200).send('OK'));
 
 app.listen(process.env.PORT || 3000, () => {
-    console.log('Webhook активний: перевірка Unpaid Custom + Subscription (без нотатки про неоплату кастому)');
+    console.log('Webhook активний: перевірка Unpaid Custom + Subscription + presale ноут тільки 1 раз на день');
 });
