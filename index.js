@@ -17,92 +17,83 @@ const FOLLOW_UP_ATTR = 'Follow-Up';
 
 const DEBUG = process.env.DEBUG === 'true' || process.env.DEBUG === '1';
 
-// === НОВОЕ: КОНТРОЛЬ "СЛЕДУЮЩИЙ ДЕНЬ" ===
-// Теперь ноут появляется ТОЛЬКО 1 раз в день (при первом триггере away_mode_updated / logged_in)
-// Это решает проблему: даже если агент выключает away mode несколько раз за день — ноут не дублируется.
-// Работает как "следующий день" по календарю (10.04 → 11.04). Reassign replies не имеет вебхука, поэтому этот workaround идеально заменяет твою идею.
-const lastProcessedDay = new Map();
+// === НОВЫЙ ПОДХОД: только logged_in + проверка времени (утро следующего дня) ===
+const lastProcessedDate = new Map(); // adminId → YYYY-MM-DD
 
-const processedConversations = new Set();               // можно оставить, но уже не используется для unpaid
-const processedSubscriptionConversations = new Set();
-const processedTransferConversations = new Set();
-
-if (!INTERCOM_TOKEN || !LIST_URL || !ADMIN_ID) {
-    console.error('ОШИБКА: INTERCOM_TOKEN, LIST_URL или ADMIN_ID не заданы!');
-    process.exit(1);
-}
-
-console.log('Webhook запущен (с проверкой следующего дня для presale ноутов)');
+console.log('Webhook запущен — presale ноут ТОЛЬКО при logged_in + утром');
 
 function log(...args) {
     if (DEBUG) console.log(...args);
 }
 
-// === ФУНКЦИЯ ОБНОВЛЕНИЯ АТРИБУТОВ КОНТАКТУ ===
-async function updateContactAttribute(contactId, attributes) {
-    if (!contactId || !attributes) return;
-    try {
-        await axios.put(`https://api.intercom.io/contacts/${contactId}`, {
-            custom_attributes: attributes
-        }, {
-            headers: {
-                'Authorization': `Bearer ${INTERCOM_TOKEN}`,
-                'Content-Type': 'application/json',
-                'Accept': 'application/json',
-                'Intercom-Version': INTERCOM_VERSION
-            },
-            timeout: 8000
-        });
-        log(`[ATTR UPDATE] Контакт ${contactId} оновлено:`, attributes);
-    } catch (error) {
-        console.error(`[ATTR UPDATE FAIL] Контакт ${contactId}:`, error.response?.data || error.message);
+// === ПРОВЕРКА — можно ли сейчас показывать ноут (утро + новый день) ===
+function canShowPresaleNote(adminId) {
+    const now = new Date();
+    const todayStr = now.toISOString().split('T')[0]; // YYYY-MM-DD
+    const currentHour = now.getHours();
+
+    // Показываем только если:
+    // 1. Новый день
+    // 2. Утро (до 13:00 например)
+    if (lastProcessedDate.has(adminId) && lastProcessedDate.get(adminId) === todayStr) {
+        log(`[PRESALE SKIP] Уже было сегодня для ${adminId}`);
+        return false;
     }
+
+    if (currentHour >= 13) {
+        log(`[PRESALE SKIP] Уже после обеда (${currentHour}:00) — ноут не показываем`);
+        return false;
+    }
+
+    lastProcessedDate.set(adminId, todayStr);
+    return true;
 }
 
-// === ДОБАВЛЕНИЕ ЗАМЕТКИ ===
-async function addNoteWithDelay(conversationId, text, delay = DELAY_MS, adminId = ADMIN_ID) {
-    if (!conversationId) return;
-    setTimeout(async () => {
-        try {
-            await axios.post(`https://api.intercom.io/conversations/${conversationId}/reply`, {
-                message_type: 'note',
-                admin_id: adminId,
-                body: text
-            }, {
-                headers: {
-                    'Authorization': `Bearer ${INTERCOM_TOKEN}`,
-                    'Content-Type': 'application/json',
-                    'Accept': 'application/json',
-                    'Intercom-Version': INTERCOM_VERSION
-                },
-                timeout: 6000
-            });
-            log(`[NOTE] від ${adminId}: "${text.slice(0, 60)}..." → ${conversationId}`);
-        } catch (error) {
-            console.error(`[NOTE FAIL] conv ${conversationId}:`, error.response?.data || error.message);
-        }
-    }, delay);
-}
+// === PRESALE PROCESSING ===
+async function processSnoozedForAdmin(adminId) {
+    if (!PRESALE_TEAM_ID || !adminId) return;
 
-// === ДОБАВЛЕНИЕ ТЕГА ===
-async function addTagToConversation(conversationId, tagId = PRESALE_FOLLOWUP_TAG_ID, adminId = ADMIN_ID) {
-    if (!conversationId) return;
+    if (!canShowPresaleNote(adminId)) return;
+
+    log(`[PRESALE START] Запуск presale-логики для админа ${adminId} (утро нового дня)`);
+
     try {
-        await axios.post(`https://api.intercom.io/conversations/${conversationId}/tags`, {
-            id: tagId,
-            admin_id: adminId
-        }, {
-            headers: {
-                'Authorization': `Bearer ${INTERCOM_TOKEN}`,
-                'Content-Type': 'application/json',
-                'Accept': 'application/json',
-                'Intercom-Version': INTERCOM_VERSION
-            },
-            timeout: 8000
-        });
-        log(`[TAG SUCCESS] ID ${tagId} додано в ${conversationId}`);
-    } catch (error) {
-        log(`[TAG FAIL] ${conversationId}:`, error.message);
+        let startingAfter = null;
+        do {
+            const searchBody = {
+                query: {
+                    operator: "AND",
+                    value: [
+                        { field: "team_assignee_id", operator: "=", value: PRESALE_TEAM_ID },
+                        { field: "admin_assignee_id", operator: "=", value: adminId },
+                        { field: "state", operator: "=", value: "snoozed" }
+                    ]
+                },
+                pagination: { per_page: 50 }
+            };
+            if (startingAfter) searchBody.pagination.starting_after = startingAfter;
+
+            const res = await axios.post(`https://api.intercom.io/conversations/search`, searchBody, {
+                headers: { 
+                    'Authorization': `Bearer ${INTERCOM_TOKEN}`, 
+                    'Content-Type': 'application/json', 
+                    'Accept': 'application/json', 
+                    'Intercom-Version': INTERCOM_VERSION 
+                }
+            });
+
+            const convs = res.data.conversations || [];
+            for (const conv of convs) {
+                if (await isFollowUpBlocked(conv.id)) continue;
+
+                await unsnoozeConversation(conv.id, adminId);
+                await addNoteWithDelay(conv.id, PRESALE_NOTE_TEXT, 3000, ADMIN_ID);
+                await addTagToConversation(conv.id);
+            }
+            startingAfter = res.data.pages?.next?.starting_after;
+        } while (startingAfter);
+    } catch (e) {
+        console.error('[PRESALE ERROR]:', e.message);
     }
 }
 
@@ -127,7 +118,7 @@ async function unsnoozeConversation(conversationId, adminId = ADMIN_ID) {
     }
 }
 
-// === ПРОВЕРКА Follow-Up атрибута ===
+// === ПРОВЕРКА Follow-Up ===
 async function isFollowUpBlocked(conversationId) {
     try {
         const res = await axios.get(`https://api.intercom.io/conversations/${conversationId}`, {
@@ -143,54 +134,71 @@ async function isFollowUpBlocked(conversationId) {
     }
 }
 
-// === PRESALE PROCESSING (с проверкой следующего дня) ===
-async function processSnoozedForAdmin(adminId) {
-    if (!PRESALE_TEAM_ID || !adminId) return;
-
-    // === НОВАЯ ЛОГИКА: проверяем, что это точно следующий день ===
-    const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
-    if (lastProcessedDay.has(adminId) && lastProcessedDay.get(adminId) === today) {
-        log(`[PRESALE SKIP] Уже обработано сегодня для админа ${adminId} — ноут НЕ появится повторно (даже при away mode off)`);
-        return;
-    }
-    lastProcessedDay.set(adminId, today);
-    log(`[PRESALE START] Первый запуск сегодня для админа ${adminId} — unsnooze + ноут`);
-
-    try {
-        let startingAfter = null;
-        do {
-            const searchBody = {
-                query: {
-                    operator: "AND",
-                    value: [
-                        { field: "team_assignee_id", operator: "=", value: PRESALE_TEAM_ID },
-                        { field: "admin_assignee_id", operator: "=", value: adminId },
-                        { field: "state", operator: "=", value: "snoozed" }
-                    ]
+// === ДОБАВЛЕНИЕ ЗАМЕТКИ, ТЕГА, АТРИБУТОВ — (оставил без изменений) ===
+async function addNoteWithDelay(conversationId, text, delay = DELAY_MS, adminId = ADMIN_ID) {
+    if (!conversationId) return;
+    setTimeout(async () => {
+        try {
+            await axios.post(`https://api.intercom.io/conversations/${conversationId}/reply`, {
+                message_type: 'note',
+                admin_id: adminId,
+                body: text
+            }, {
+                headers: {
+                    'Authorization': `Bearer ${INTERCOM_TOKEN}`,
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json',
+                    'Intercom-Version': INTERCOM_VERSION
                 },
-                pagination: { per_page: 50 }
-            };
-            if (startingAfter) searchBody.pagination.starting_after = startingAfter;
-
-            const res = await axios.post(`https://api.intercom.io/conversations/search`, searchBody, {
-                headers: { 'Authorization': `Bearer ${INTERCOM_TOKEN}`, 'Content-Type': 'application/json', 'Accept': 'application/json', 'Intercom-Version': INTERCOM_VERSION }
+                timeout: 6000
             });
+            log(`[NOTE] "${text.slice(0, 60)}..." → ${conversationId}`);
+        } catch (error) {
+            console.error(`[NOTE FAIL] ${conversationId}:`, error.message);
+        }
+    }, delay);
+}
 
-            const convs = res.data.conversations || [];
-            for (const conv of convs) {
-                if (await isFollowUpBlocked(conv.id)) continue;
-                await unsnoozeConversation(conv.id, adminId);
-                await addNoteWithDelay(conv.id, PRESALE_NOTE_TEXT, 3000, ADMIN_ID);
-                await addTagToConversation(conv.id);
-            }
-            startingAfter = res.data.pages?.next?.starting_after;
-        } while (startingAfter);
-    } catch (e) {
-        console.error('[PRESALE ERROR]:', e.message);
+async function addTagToConversation(conversationId, tagId = PRESALE_FOLLOWUP_TAG_ID, adminId = ADMIN_ID) {
+    if (!conversationId) return;
+    try {
+        await axios.post(`https://api.intercom.io/conversations/${conversationId}/tags`, {
+            id: tagId,
+            admin_id: adminId
+        }, {
+            headers: {
+                'Authorization': `Bearer ${INTERCOM_TOKEN}`,
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+                'Intercom-Version': INTERCOM_VERSION
+            },
+            timeout: 8000
+        });
+    } catch (error) {
+        log(`[TAG FAIL] ${conversationId}:`, error.message);
     }
 }
 
-// === ОСНОВНАЯ ПЕРЕВІРКА ТА ОНОВЛЕННЯ (Subscription + Unpaid) ===
+async function updateContactAttribute(contactId, attributes) {
+    if (!contactId || !attributes) return;
+    try {
+        await axios.put(`https://api.intercom.io/contacts/${contactId}`, {
+            custom_attributes: attributes
+        }, {
+            headers: {
+                'Authorization': `Bearer ${INTERCOM_TOKEN}`,
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+                'Intercom-Version': INTERCOM_VERSION
+            },
+            timeout: 8000
+        });
+    } catch (error) {
+        console.error(`[ATTR FAIL] ${contactId}:`, error.message);
+    }
+}
+
+// === ОСНОВНАЯ ЛОГИКА validateAndSetCustom (без изменений) ===
 async function validateAndSetCustom(contactId, conversationId) {
     if (!contactId || !conversationId) return;
     try {
@@ -211,33 +219,31 @@ async function validateAndSetCustom(contactId, conversationId) {
             contact.custom_attributes?.['Purchase email']
         ].filter(Boolean);
 
-        // Перевірка Unpaid Custom — ТІЛЬКИ атрибут, без нотатки
         if (emails.length > 0) {
             const { data: emailList } = await axios.get(LIST_URL, { timeout: 5000 });
-           
             if (Array.isArray(emailList)) {
                 const isMatch = emails.some(e =>
                     emailList.some(le => (le || '').trim().toLowerCase() === e.trim().toLowerCase())
                 );
-
                 if (isMatch && currentUnpaidStatus !== true) {
                     await updateContactAttribute(contactId, { [CUSTOM_ATTR_NAME]: true });
                 }
             }
         }
 
-        // Перевірка Subscription — без змін
         if (!subscription.trim() && !processedSubscriptionConversations.has(conversationId)) {
             processedSubscriptionConversations.add(conversationId);
             await addNoteWithDelay(conversationId, 'Заповніть будь ласка subscription 😇🙏', 10000);
         }
-
     } catch (e) {
         console.error(`[VALIDATE ERROR] contact ${contactId}:`, e.message);
     }
 }
 
-// === WEBHOOK ENDPOINT ===
+const processedSubscriptionConversations = new Set();
+const processedTransferConversations = new Set();
+
+// === WEBHOOK ===
 app.post('/validate-email', async (req, res) => {
     const body = req.body;
     const topic = body.topic;
@@ -247,8 +253,8 @@ app.post('/validate-email', async (req, res) => {
     const conversationId = item.id;
     let contactId = item.contacts?.contacts?.[0]?.id || item.author?.id;
 
-    // Сценарії Presale (Away / Login) — теперь с проверкой следующего дня
-    if ((topic === 'admin.away_mode_updated' && !item.away_mode_enabled) || topic === 'admin.logged_in') {
+    // === ТОЛЬКО logged_in — убрали away_mode_updated полностью ===
+    if (topic === 'admin.logged_in') {
         processSnoozedForAdmin(item.id);
         return res.status(200).json({ ok: true });
     }
@@ -258,7 +264,8 @@ app.post('/validate-email', async (req, res) => {
         const prev = item.previous_assignee || (item.conversation_parts?.conversation_parts?.[0]?.assignee);
         const assignee = item.assignee;
         
-        const isTransferFromBot = (prev?.type === 'bot' || (prev?.type === 'admin' && prev.id?.startsWith('bot_'))) && assignee?.type === 'team';
+        const isTransferFromBot = (prev?.type === 'bot' || (prev?.type === 'admin' && prev.id?.startsWith('bot_'))) 
+                               && assignee?.type === 'team';
         
         if (isTransferFromBot && !processedTransferConversations.has(conversationId)) {
             processedTransferConversations.add(conversationId);
@@ -268,13 +275,11 @@ app.post('/validate-email', async (req, res) => {
         return res.status(200).json({ ok: true });
     }
 
-    // Клієнт відповів
     if (topic === 'conversation.user.replied') {
         if (contactId && conversationId) await validateAndSetCustom(contactId, conversationId);
         return res.status(200).json({ ok: true });
     }
 
-    // Загальна перевірка для інших випадків
     if (contactId && conversationId) {
         await validateAndSetCustom(contactId, conversationId);
     }
@@ -285,5 +290,5 @@ app.post('/validate-email', async (req, res) => {
 app.head('/validate-email', (req, res) => res.status(200).send('OK'));
 
 app.listen(process.env.PORT || 3000, () => {
-    console.log('Webhook активний: перевірка Unpaid Custom + Subscription + presale ноут тільки 1 раз на день');
+    console.log('Webhook активний: presale ноут ТОЛЬКО при logged_in + утром следующего дня');
 });
