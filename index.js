@@ -11,61 +11,73 @@ const ADMIN_ID = process.env.ADMIN_ID;
 const PRESALE_TEAM_ID = process.env.PRESALE_TEAM_ID;
 const PRESALE_NOTE_TEXT = process.env.PRESALE_NOTE_TEXT || 'Агент вийшов в онлайн — перевіряємо snoozed чати presale 😎';
 const INTERCOM_VERSION = '2.14';
-const DELAY_MS = 30000;
+const DELAY_MS = 3000;                    // зменшив, бо тепер не масово
 const PRESALE_FOLLOWUP_TAG_ID = '13404165';
 const FOLLOW_UP_ATTR = 'Follow-Up';
 
 const DEBUG = process.env.DEBUG === 'true' || process.env.DEBUG === '1';
 
-// === НОВЫЙ ПОДХОД: только logged_in + проверка времени (утро следующего дня) ===
+// === Один раз на день на адміна ===
 const lastProcessedDate = new Map(); // adminId → YYYY-MM-DD
 
-console.log('Webhook запущен — presale ноут ТОЛЬКО при logged_in + утром');
+console.log('Webhook запущен — presale ноут ТІЛЬКИ при logged_in + один раз на день');
+
+// === ЛОГІКА "один раз сьогодні" ===
+function canShowPresaleNote(adminId) {
+    const now = new Date();
+    const todayStr = now.toISOString().split('T')[0];
+
+    if (lastProcessedDate.has(adminId) && lastProcessedDate.get(adminId) === todayStr) {
+        log(`[PRESALE SKIP] Уже обробляли сьогодні для ${adminId}`);
+        return false;
+    }
+
+    lastProcessedDate.set(adminId, todayStr);
+    log(`[PRESALE ALLOWED] Перший logged_in сьогодні для ${adminId} — запускаємо обробку`);
+    return true;
+}
 
 function log(...args) {
     if (DEBUG) console.log(...args);
 }
 
-// === ПРОВЕРКА — можно ли сейчас показывать ноут (утро + новый день) ===
-function canShowPresaleNote(adminId) {
-    const now = new Date();
-    const todayStr = now.toISOString().split('T')[0]; // YYYY-MM-DD
-    const currentHour = now.getHours();
+// === UNSNOOZE + NOTE + TAG (тільки для конкретного чату) ===
+async function processSingleConversation(convId, adminId) {
+    if (!convId) return;
 
-    // Показываем только если:
-    // 1. Новый день
-    // 2. Утро (до 13:00 например)
-    if (lastProcessedDate.has(adminId) && lastProcessedDate.get(adminId) === todayStr) {
-        log(`[PRESALE SKIP] Уже было сегодня для ${adminId}`);
-        return false;
+    try {
+        // 1. Розснузити
+        await unsnoozeConversation(convId, adminId);
+
+        // 2. Додати ноут
+        await addNoteWithDelay(convId, PRESALE_NOTE_TEXT, 2000, ADMIN_ID);
+
+        // 3. Додати тег
+        await addTagToConversation(convId);
+
+        log(`[PRESALE PROCESSED] Чат ${convId} → розснузили + ноут + тег`);
+    } catch (e) {
+        console.error(`[PRESALE SINGLE FAIL] ${convId}:`, e.message);
     }
-
-    if (currentHour >= 13) {
-        log(`[PRESALE SKIP] Уже после обеда (${currentHour}:00) — ноут не показываем`);
-        return false;
-    }
-
-    lastProcessedDate.set(adminId, todayStr);
-    return true;
 }
 
-// === PRESALE PROCESSING ===
+// === PRESALE PROCESSING — тепер обробляє по одному (не всі одразу) ===
 async function processSnoozedForAdmin(adminId) {
     if (!PRESALE_TEAM_ID || !adminId) return;
-
     if (!canShowPresaleNote(adminId)) return;
 
-    log(`[PRESALE START] Запуск presale-логики для админа ${adminId} (утро нового дня)`);
+    log(`[PRESALE START] Починаємо обробку snoozed чатів presale для ${adminId}`);
 
     try {
         let startingAfter = null;
+        let processedCount = 0;
+
         do {
             const searchBody = {
                 query: {
                     operator: "AND",
                     value: [
                         { field: "team_assignee_id", operator: "=", value: PRESALE_TEAM_ID },
-                        { field: "admin_assignee_id", operator: "=", value: adminId },
                         { field: "state", operator: "=", value: "snoozed" }
                     ]
                 },
@@ -74,30 +86,42 @@ async function processSnoozedForAdmin(adminId) {
             if (startingAfter) searchBody.pagination.starting_after = startingAfter;
 
             const res = await axios.post(`https://api.intercom.io/conversations/search`, searchBody, {
-                headers: { 
-                    'Authorization': `Bearer ${INTERCOM_TOKEN}`, 
-                    'Content-Type': 'application/json', 
-                    'Accept': 'application/json', 
-                    'Intercom-Version': INTERCOM_VERSION 
+                headers: {
+                    'Authorization': `Bearer ${INTERCOM_TOKEN}`,
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json',
+                    'Intercom-Version': INTERCOM_VERSION
                 }
             });
 
             const convs = res.data.conversations || [];
-            for (const conv of convs) {
-                if (await isFollowUpBlocked(conv.id)) continue;
+            log(`[SEARCH] Знайдено ${convs.length} snoozed чатів на цій сторінці`);
 
-                await unsnoozeConversation(conv.id, adminId);
-                await addNoteWithDelay(conv.id, PRESALE_NOTE_TEXT, 3000, ADMIN_ID);
-                await addTagToConversation(conv.id);
+            for (const conv of convs) {
+                if (await isFollowUpBlocked(conv.id)) {
+                    log(`[SKIP] ${conv.id} — Follow-Up заблоковано`);
+                    continue;
+                }
+
+                // Обробляємо кожен чат окремо
+                await processSingleConversation(conv.id, adminId);
+                processedCount++;
+
+                // Невелика затримка між чатами, щоб Intercom не блокував
+                await new Promise(r => setTimeout(r, 800));
             }
+
             startingAfter = res.data.pages?.next?.starting_after;
         } while (startingAfter);
+
+        log(`[PRESALE FINISH] Усього оброблено чатів: ${processedCount}`);
+
     } catch (e) {
-        console.error('[PRESALE ERROR]:', e.message);
+        console.error('[PRESALE ERROR]:', e.response?.data || e.message);
     }
 }
 
-// === UNSNOOZE ===
+// === ДОПОМІЖНІ ФУНКЦІЇ (без змін) ===
 async function unsnoozeConversation(conversationId, adminId = ADMIN_ID) {
     if (!conversationId) return;
     try {
@@ -118,7 +142,6 @@ async function unsnoozeConversation(conversationId, adminId = ADMIN_ID) {
     }
 }
 
-// === ПРОВЕРКА Follow-Up ===
 async function isFollowUpBlocked(conversationId) {
     try {
         const res = await axios.get(`https://api.intercom.io/conversations/${conversationId}`, {
@@ -134,7 +157,6 @@ async function isFollowUpBlocked(conversationId) {
     }
 }
 
-// === ДОБАВЛЕНИЕ ЗАМЕТКИ, ТЕГА, АТРИБУТОВ — (оставил без изменений) ===
 async function addNoteWithDelay(conversationId, text, delay = DELAY_MS, adminId = ADMIN_ID) {
     if (!conversationId) return;
     setTimeout(async () => {
@@ -179,26 +201,10 @@ async function addTagToConversation(conversationId, tagId = PRESALE_FOLLOWUP_TAG
     }
 }
 
-async function updateContactAttribute(contactId, attributes) {
-    if (!contactId || !attributes) return;
-    try {
-        await axios.put(`https://api.intercom.io/contacts/${contactId}`, {
-            custom_attributes: attributes
-        }, {
-            headers: {
-                'Authorization': `Bearer ${INTERCOM_TOKEN}`,
-                'Content-Type': 'application/json',
-                'Accept': 'application/json',
-                'Intercom-Version': INTERCOM_VERSION
-            },
-            timeout: 8000
-        });
-    } catch (error) {
-        console.error(`[ATTR FAIL] ${contactId}:`, error.message);
-    }
-}
+// === validateAndSetCustom (без змін) ===
+const processedSubscriptionConversations = new Set();
+const processedTransferConversations = new Set();
 
-// === ОСНОВНАЯ ЛОГИКА validateAndSetCustom (без изменений) ===
 async function validateAndSetCustom(contactId, conversationId) {
     if (!contactId || !conversationId) return;
     try {
@@ -240,8 +246,24 @@ async function validateAndSetCustom(contactId, conversationId) {
     }
 }
 
-const processedSubscriptionConversations = new Set();
-const processedTransferConversations = new Set();
+async function updateContactAttribute(contactId, attributes) {
+    if (!contactId || !attributes) return;
+    try {
+        await axios.put(`https://api.intercom.io/contacts/${contactId}`, {
+            custom_attributes: attributes
+        }, {
+            headers: {
+                'Authorization': `Bearer ${INTERCOM_TOKEN}`,
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+                'Intercom-Version': INTERCOM_VERSION
+            },
+            timeout: 8000
+        });
+    } catch (error) {
+        console.error(`[ATTR FAIL] ${contactId}:`, error.message);
+    }
+}
 
 // === WEBHOOK ===
 app.post('/validate-email', async (req, res) => {
@@ -253,8 +275,9 @@ app.post('/validate-email', async (req, res) => {
     const conversationId = item.id;
     let contactId = item.contacts?.contacts?.[0]?.id || item.author?.id;
 
-    // === ТОЛЬКО logged_in — убрали away_mode_updated полностью ===
-    if (topic === 'admin.logged_in') {
+    // === PRESALE ЛОГІКА ===
+    if (topic === 'admin.logged_in' || 
+       (topic === 'admin.away_mode_updated' && item.away_mode_enabled === false)) {
         processSnoozedForAdmin(item.id);
         return res.status(200).json({ ok: true });
     }
@@ -264,7 +287,7 @@ app.post('/validate-email', async (req, res) => {
         const prev = item.previous_assignee || (item.conversation_parts?.conversation_parts?.[0]?.assignee);
         const assignee = item.assignee;
         
-        const isTransferFromBot = (prev?.type === 'bot' || (prev?.type === 'admin' && prev.id?.startsWith('bot_'))) 
+        const isTransferFromBot = (prev?.type === 'bot' || (prev?.type === 'admin' && prev.id?.startsWith('bot_')))
                                && assignee?.type === 'team';
         
         if (isTransferFromBot && !processedTransferConversations.has(conversationId)) {
@@ -290,5 +313,5 @@ app.post('/validate-email', async (req, res) => {
 app.head('/validate-email', (req, res) => res.status(200).send('OK'));
 
 app.listen(process.env.PORT || 3000, () => {
-    console.log('Webhook активний: presale ноут ТОЛЬКО при logged_in + утром следующего дня');
+    console.log('Webhook активний: presale ноут + unsnooze ТІЛЬКИ в тих чатах, куди ставимо ноут (один раз на день)');
 });
