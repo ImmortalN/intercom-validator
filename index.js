@@ -44,29 +44,33 @@ function log(...args) {
 // === UNSNOOZE + NOTE + TAG (тільки для конкретного чату) ===
 async function processSingleConversation(convId, adminId) {
     if (!convId) return;
-
     try {
         // 1. Розснузити
         await unsnoozeConversation(convId, adminId);
-
+        
         // 2. Додати ноут
-        await addNoteWithDelay(convId, PRESALE_NOTE_TEXT, 2000, ADMIN_ID);
-
+        await addNoteWithDelay(convId, PRESALE_NOTE_TEXT, 2500, ADMIN_ID);
+        
         // 3. Додати тег
         await addTagToConversation(convId);
 
-        log(`[PRESALE PROCESSED] Чат ${convId} → розснузили + ноут + тег`);
+        // Один лог замість двох
+        log(`✅ [PRESALE PROCESSED] Чат ${convId} → розснузили + ноут + тег (старий чат)`);
+        
     } catch (e) {
         console.error(`[PRESALE SINGLE FAIL] ${convId}:`, e.message);
     }
 }
 
-// === PRESALE PROCESSING — тепер обробляє по одному (не всі одразу) ===
+// === PRESALE PROCESSING — тільки чати, засунуті ДО СЬОГОДНІ ===
 async function processSnoozedForAdmin(adminId) {
     if (!PRESALE_TEAM_ID || !adminId) return;
     if (!canShowPresaleNote(adminId)) return;
 
-    log(`[PRESALE START] Починаємо обробку snoozed чатів presale для ${adminId}`);
+    const now = new Date();
+    const todayMidnight = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0);
+    
+    log(`[PRESALE START] Шукаємо snoozed чати presale, засунуті ДО сьогодні (${todayMidnight.toISOString()})`);
 
     try {
         let startingAfter = null;
@@ -78,7 +82,12 @@ async function processSnoozedForAdmin(adminId) {
                     operator: "AND",
                     value: [
                         { field: "team_assignee_id", operator: "=", value: PRESALE_TEAM_ID },
-                        { field: "state", operator: "=", value: "snoozed" }
+                        { field: "state", operator: "=", value: "snoozed" },
+                        { 
+                            field: "snoozed_until", 
+                            operator: "<", 
+                            value: Math.floor(todayMidnight.getTime() / 1000) 
+                        }
                     ]
                 },
                 pagination: { per_page: 50 }
@@ -95,7 +104,7 @@ async function processSnoozedForAdmin(adminId) {
             });
 
             const convs = res.data.conversations || [];
-            log(`[SEARCH] Знайдено ${convs.length} snoozed чатів на цій сторінці`);
+            log(`[SEARCH] Знайдено ${convs.length} старих snoozed чатів`);
 
             for (const conv of convs) {
                 if (await isFollowUpBlocked(conv.id)) {
@@ -103,18 +112,16 @@ async function processSnoozedForAdmin(adminId) {
                     continue;
                 }
 
-                // Обробляємо кожен чат окремо
                 await processSingleConversation(conv.id, adminId);
                 processedCount++;
 
-                // Невелика затримка між чатами, щоб Intercom не блокував
                 await new Promise(r => setTimeout(r, 800));
             }
 
             startingAfter = res.data.pages?.next?.starting_after;
         } while (startingAfter);
 
-        log(`[PRESALE FINISH] Усього оброблено чатів: ${processedCount}`);
+        log(`[PRESALE FINISH] Оброблено старих чатів: ${processedCount}`);
 
     } catch (e) {
         console.error('[PRESALE ERROR]:', e.response?.data || e.message);
