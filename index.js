@@ -4,35 +4,43 @@ const axios = require('axios');
 const app = express();
 app.use(express.json());
 
-// ================= ENV =================
+// ===== BASIC ROUTE =====
+app.get('/', (req, res) => {
+  console.log('✅ Health check hit');
+  res.send('OK');
+});
+
+// ===== GLOBAL LOGGER =====
+app.use((req, res, next) => {
+  console.log(`[GLOBAL LOG] ${new Date().toISOString()} | ${req.method} ${req.url}`);
+  next();
+});
+
+// ===== ENV =====
 const INTERCOM_TOKEN = process.env.INTERCOM_TOKEN;
-const LIST_URL = process.env.LIST_URL;
 const ADMIN_ID = process.env.ADMIN_ID;
 const PRESALE_TEAM_ID = process.env.PRESALE_TEAM_ID;
+const LIST_URL = process.env.LIST_URL;
 
 const INTERCOM_VERSION = '2.14';
-
-const CUSTOM_ATTR_NAME = 'Unpaid Custom';
 const FOLLOW_UP_ATTR = 'Follow-Up';
+const PRESALE_NOTE_TEXT = 'Агент вийшов онлайн — перевіряємо старі presale чати 😎';
 
-const PRESALE_NOTE_TEXT =
-  process.env.PRESALE_NOTE_TEXT ||
-  'Агент вийшов в онлайн — перевіряємо snoozed чати presale 😎';
+const processedToday = new Map();
 
-// ================= STATE =================
-// adminId → { date, lastAwayState }
-const presaleState = new Map();
-
-// conversationId → processed flags
-const processedConversations = new Set();
-
-// ================= LOG =================
+// ===== HELPERS =====
 function log(...args) {
   console.log('[DEBUG]', ...args);
 }
 
-// ================= INTERCOM =================
-async function intercomRequest(method, url, data) {
+function canRunOncePerDay(adminId) {
+  const today = new Date().toISOString().split('T')[0];
+  if (processedToday.get(adminId) === today) return false;
+  processedToday.set(adminId, today);
+  return true;
+}
+
+async function intercomRequest(method, url, data = {}) {
   return axios({
     method,
     url: `https://api.intercom.io${url}`,
@@ -45,16 +53,92 @@ async function intercomRequest(method, url, data) {
   });
 }
 
-// ================= EMAIL CHECK =================
-async function validateEmail(contactId) {
+// ===== CORE ACTIONS =====
+async function resnoozeConversation(conversationId) {
+  const snoozedUntil = Math.floor(Date.now() / 1000) + 60;
+
+  try {
+    await intercomRequest('post', `/conversations/${conversationId}/snooze`, {
+      snoozed_until: snoozedUntil,
+      admin_id: ADMIN_ID
+    });
+
+    log(`⏰ Resnoozed ${conversationId}`);
+  } catch (e) {
+    log('RESNOOZE ERROR', e.response?.data || e.message);
+  }
+}
+
+async function addNote(conversationId, text) {
+  try {
+    await intercomRequest('post', `/conversations/${conversationId}/reply`, {
+      message_type: 'note',
+      admin_id: ADMIN_ID,
+      body: text
+    });
+
+    log(`📝 Note added ${conversationId}`);
+  } catch (e) {
+    log('NOTE ERROR', e.response?.data || e.message);
+  }
+}
+
+// ===== PRESALE =====
+async function processPresale(adminId) {
+  if (!PRESALE_TEAM_ID) return;
+  if (!canRunOncePerDay(adminId)) return;
+
+  console.log(`🚀 PRESALE START for admin ${adminId}`);
+
+  try {
+    const todayMidnight = Math.floor(new Date().setHours(0, 0, 0, 0) / 1000);
+
+    const res = await intercomRequest('post', '/conversations/search', {
+      query: {
+        operator: 'AND',
+        value: [
+          { field: 'team_assignee_id', operator: '=', value: PRESALE_TEAM_ID },
+          { field: 'state', operator: '=', value: 'snoozed' },
+          { field: 'snoozed_until', operator: '<', value: todayMidnight }
+        ]
+      }
+    });
+
+    const conversations = res.data.conversations || [];
+
+    log(`📦 Found ${conversations.length} conversations`);
+
+    for (const conv of conversations) {
+      const full = await intercomRequest('get', `/conversations/${conv.id}`);
+
+      if (full.data.custom_attributes?.[FOLLOW_UP_ATTR] === true) {
+        log(`⛔ Skip ${conv.id} (Follow-Up)`);
+        continue;
+      }
+
+      await resnoozeConversation(conv.id);
+      await addNote(conv.id, PRESALE_NOTE_TEXT);
+
+      await new Promise(r => setTimeout(r, 300)); // anti-rate-limit
+    }
+
+    console.log(`✅ PRESALE DONE`);
+  } catch (e) {
+    console.error('PRESALE ERROR', e.response?.data || e.message);
+  }
+}
+
+// ===== EMAIL =====
+async function validateEmail(contactId, conversationId) {
   if (!contactId || !LIST_URL) return;
 
   try {
-    const contact = await intercomRequest('get', `/contacts/${contactId}`);
+    const contactRes = await intercomRequest('get', `/contacts/${contactId}`);
+    const contact = contactRes.data;
 
     const emails = [
-      contact.data.email,
-      contact.data.custom_attributes?.['Purchase email']
+      contact.email,
+      contact.custom_attributes?.['Purchase email']
     ].filter(Boolean);
 
     if (!emails.length) return;
@@ -62,224 +146,74 @@ async function validateEmail(contactId) {
     const { data: list } = await axios.get(LIST_URL);
 
     const match = emails.some(e =>
-      list.some(l =>
-        (l || '').toLowerCase().trim() === e.toLowerCase().trim()
-      )
+      list.some(l => l.toLowerCase().trim() === e.toLowerCase().trim())
     );
 
     if (match) {
       await intercomRequest('put', `/contacts/${contactId}`, {
-        custom_attributes: {
-          [CUSTOM_ATTR_NAME]: true
-        }
+        custom_attributes: { 'Unpaid Custom': true }
       });
 
-      log(`💰 Unpaid set for ${contactId}`);
+      log(`💰 Unpaid set ${contactId}`);
     }
   } catch (e) {
-    console.error('[EMAIL ERROR]', e.message);
+    log('EMAIL ERROR', e.message);
   }
 }
 
-// ================= SUBSCRIPTION CHECK =================
-async function checkSubscription(conversationId, contact) {
-  const subscription =
-    contact.custom_attributes?.Subscription ||
-    contact.custom_attributes?.subscription;
+// ===== WEBHOOK =====
+app.post('/validate-email', async (req, res) => {
+  console.log('🔥 WEBHOOK HIT');
 
-  if (!subscription || subscription.trim() === '') {
-    await intercomRequest('post', `/conversations/${conversationId}/reply`, {
-      message_type: 'note',
-      admin_id: ADMIN_ID,
-      body: 'Please fill subscription 😇'
-    });
+  // 🔥 CRITICAL DEBUG — всегда смотри payload
+  console.log('📦 FULL PAYLOAD:\n', JSON.stringify(req.body, null, 2));
 
-    log(`📝 subscription note → ${conversationId}`);
-  }
-}
+  const topic = req.body.topic;
+  const item = req.body.data?.item;
 
-// ================= PRESALE HELPERS =================
-function isFirstExitToday(adminId) {
-  const today = new Date().toISOString().split('T')[0];
-  const state = presaleState.get(adminId);
+  console.log(`📩 Topic: ${topic}`);
 
-  return state?.lastDate !== today;
-}
-
-function updateAdminState(adminId, awayMode) {
-  const today = new Date().toISOString().split('T')[0];
-
-  presaleState.set(adminId, {
-    lastDate: today,
-    lastAwayState: awayMode
-  });
-}
-
-// ================= LAST MESSAGE CHECK =================
-async function lastMessageNotToday(conversationId) {
-  const res = await intercomRequest(
-    'get',
-    `/conversations/${conversationId}`
-  );
-
-  const last =
-    res.data.conversation_parts?.conversation_parts?.at(-1);
-
-  if (!last?.created_at) return true;
-
-  const lastDate = new Date(last.created_at * 1000);
-  const today = new Date();
-
-  return lastDate.toDateString() !== today.toDateString();
-}
-
-// ================= PRESALE CORE =================
-async function processPresale(adminId) {
-  const today = new Date().toISOString().split('T')[0];
-
-  if (!PRESALE_TEAM_ID) return;
-
-  log('🚀 PRESALE START');
+  if (!item) return res.sendStatus(200);
 
   try {
-    const todayMidnight = Math.floor(
-      new Date().setHours(0, 0, 0, 0) / 1000
-    );
+    // ===== ADMIN EVENTS =====
+    if (
+      topic === 'admin.away_mode_updated' ||
+      topic === 'admin.logged_in' ||
+      topic === 'admin.status.updated'
+    ) {
+      const isAway =
+        item.away_mode_enabled ??
+        item.away_mode?.enabled ??
+        item.admin?.away_mode_enabled;
 
-    const res = await intercomRequest('post', '/conversations/search', {
-      query: {
-        operator: 'AND',
-        value: [
-          {
-            field: 'team_assignee_id',
-            operator: '=',
-            value: PRESALE_TEAM_ID
-          },
-          {
-            field: 'state',
-            operator: '=',
-            value: 'snoozed'
-          },
-          {
-            field: 'snoozed_until',
-            operator: '<',
-            value: todayMidnight
-          }
-        ]
+      console.log('🧠 isAway:', isAway);
+
+      if (isAway === false) {
+        console.log('👀 Admin ONLINE → presale trigger');
+        await processPresale(item.id);
       }
-    });
-
-    const conversations = res.data.conversations || [];
-
-    for (const conv of conversations) {
-      if (processedConversations.has(conv.id)) continue;
-
-      const full = await intercomRequest(
-        'get',
-        `/conversations/${conv.id}`
-      );
-
-      const followUp =
-        full.data.custom_attributes?.[FOLLOW_UP_ATTR];
-
-      if (followUp === true) {
-        log(`⛔ skip follow-up ${conv.id}`);
-        continue;
-      }
-
-      if (!(await lastMessageNotToday(conv.id))) {
-        log(`⛔ skip last message today ${conv.id}`);
-        continue;
-      }
-
-      // unsnooze
-      await intercomRequest(
-        'post',
-        `/conversations/${conv.id}/reply`,
-        {
-          message_type: 'open',
-          admin_id: ADMIN_ID
-        }
-      );
-
-      // note
-      await intercomRequest(
-        'post',
-        `/conversations/${conv.id}/reply`,
-        {
-          message_type: 'note',
-          admin_id: ADMIN_ID,
-          body: PRESALE_NOTE_TEXT
-        }
-      );
-
-      processedConversations.add(conv.id);
-
-      log(`✅ presale processed ${conv.id}`);
-
-      await new Promise(r => setTimeout(r, 400));
     }
 
-    log('✅ PRESALE DONE');
-  } catch (e) {
-    console.error('[PRESALE ERROR]', e.message);
-  }
-}
-
-// ================= WEBHOOK =================
-app.post('/validate-email', async (req, res) => {
-  // ⚠️ СРАЗУ ОТДАЁМ ОТВЕТ INTERCOM
-  res.sendStatus(200);
-
-  // ВСЁ ДАЛЬНЕЙШЕЕ — АСИНХРОННО
-  setImmediate(async () => {
-    try {
-      const body = req.body;
-      const topic = body.topic;
-      const item = body.data?.item;
-
-      console.log('🔥 WEBHOOK RECEIVED:', topic);
-
-      if (!item) return;
-
+    // ===== USER EVENTS =====
+    if (
+      topic === 'conversation.user.created' ||
+      topic === 'conversation.user.replied'
+    ) {
+      const contactId = item.contacts?.contacts?.[0]?.id;
       const conversationId = item.id;
-      const contactId =
-        item.contacts?.contacts?.[0]?.id ||
-        item.author?.id;
 
-      // ================= PRESALE =================
-      if (topic === 'admin.away_mode_updated') {
-        const isAway = item.away_mode_enabled;
-
-        updateAdminState(item.id, isAway);
-
-        if (isAway === false && isFirstExitToday(item.id)) {
-          await processPresale(item.id);
-        }
-      }
-
-      // ================= EMAIL =================
-      if (contactId) {
-        await validateEmail(contactId);
-      }
-
-      // ================= SUBSCRIPTION =================
-      if (conversationId && contactId) {
-        const contact = await intercomRequest(
-          'get',
-          `/contacts/${contactId}`
-        );
-
-        await checkSubscription(conversationId, contact.data);
-      }
-
-    } catch (e) {
-      console.error('🔥 ASYNC WEBHOOK ERROR:', e.message);
+      await validateEmail(contactId, conversationId);
     }
-  });
+
+    res.sendStatus(200);
+  } catch (e) {
+    console.error('WEBHOOK ERROR', e.message);
+    res.sendStatus(200);
+  }
 });
 
-// ================= START =================
+// ===== START =====
 app.listen(process.env.PORT || 3000, () => {
-  console.log('🚀 FINAL PRESALE ENGINE RUNNING');
+  console.log('🚀 Server started');
 });
