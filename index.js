@@ -7,22 +7,20 @@ app.use(express.json());
 // ================= CONFIG =================
 const INTERCOM_TOKEN = process.env.INTERCOM_TOKEN;
 const LIST_URL = process.env.LIST_URL;
-const ADMIN_ID = process.env.ADMIN_ID; // ID админа, от которого пишутся ноуты
+const ADMIN_ID = process.env.ADMIN_ID; 
 const PRESALE_TEAM_ID = process.env.PRESALE_TEAM_ID;
 const INTERCOM_VERSION = '2.14';
 
 const CUSTOM_ATTR_NAME = 'Unpaid Custom';
-const FOLLOW_UP_ATTR = 'Follow-Up';
+const FOLLOW_UP_ATTR = 'Follow-Up'; // Проверь, чтобы в Intercom имя было точно таким
 const PRESALE_NOTE_TEXT = process.env.PRESALE_NOTE_TEXT || 'Агент вийшов в онлайн — перевіряємо snoozed чати presale 😎';
 
-// Чтобы не спамить в один и тот же чат несколько раз за одну смену
 const processedInSession = new Set();
 
 function log(tag, message) {
     console.log(`[${tag}] ${new Date().toLocaleTimeString()}:`, message);
 }
 
-// Универсальный запрос
 async function intercomRequest(method, url, data) {
     return axios({
         method,
@@ -31,49 +29,18 @@ async function intercomRequest(method, url, data) {
         headers: {
             'Authorization': `Bearer ${INTERCOM_TOKEN}`,
             'Intercom-Version': INTERCOM_VERSION,
-            'Content-Type': 'application/json'
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
         }
     });
 }
 
-// ================= LOGIC 1: EMAIL & SUB =================
-async function checkContactData(conversationId, contactId) {
-    try {
-        const res = await intercomRequest('get', `/contacts/${contactId}`);
-        const contact = res.data;
-
-        // 1. Check Email matching
-        if (LIST_URL) {
-            const { data: list } = await axios.get(LIST_URL);
-            const contactEmails = [contact.email, contact.custom_attributes?.['Purchase email']].filter(Boolean);
-            const isUnpaid = contactEmails.some(e => list.some(l => l?.toLowerCase().trim() === e.toLowerCase().trim()));
-            
-            if (isUnpaid) {
-                await intercomRequest('put', `/contacts/${contactId}`, { custom_attributes: { [CUSTOM_ATTR_NAME]: true } });
-                log('EMAIL', `Marked ${contactId} as Unpaid`);
-            }
-        }
-
-        // 2. Check Subscription
-        const sub = contact.custom_attributes?.Subscription || contact.custom_attributes?.subscription;
-        if (!sub || sub.toString().trim() === '') {
-            await intercomRequest('post', `/conversations/${conversationId}/reply`, {
-                message_type: 'note',
-                admin_id: ADMIN_ID,
-                body: 'Please fill subscription 😇'
-            });
-            log('SUB', `Note sent to ${conversationId}`);
-        }
-    } catch (e) {
-        log('DATA_ERR', e.message);
-    }
-}
-
-// ================= LOGIC 2 & 3: PRESALE TRIGGER & ACTION =================
+// ================= LOGIC: PRESALE ENGINE =================
 async function processPresale() {
-    log('PRESALE', 'Starting scan of snoozed chats...');
+    log('PRESALE', 'Starting scan...');
     try {
-        const search = await intercomRequest('post', '/conversations/search', {
+        // Точь-в-точь как в твоем Postman
+        const searchRes = await intercomRequest('post', '/conversations/search', {
             query: {
                 operator: 'AND',
                 value: [
@@ -83,32 +50,37 @@ async function processPresale() {
             }
         });
 
-        const conversations = search.data.conversations || [];
-        log('PRESALE', `Found ${conversations.length} snoozed chats in team.`);
+        const conversations = searchRes.data.conversations || [];
+        log('PRESALE', `Found ${conversations.length} total snoozed chats.`);
 
-        const startOfToday = new Date().setHours(0, 0, 0, 0) / 1000;
+        const startOfTodayUnix = Math.floor(new Date().setHours(0, 0, 0, 0) / 1000);
 
         for (const conv of conversations) {
             if (processedInSession.has(conv.id)) continue;
 
-            // Получаем полные данные чата для проверки атрибутов и даты
+            // В результатах поиска нет всех custom_attributes, запрашиваем детально
             const full = await intercomRequest('get', `/conversations/${conv.id}`);
-            const data = full.data;
+            const chat = full.data;
 
-            const isFollowUp = data.custom_attributes?.[FOLLOW_UP_ATTR] === true;
-            const wasUpdatedBeforeToday = data.updated_at < startOfToday;
+            // УСЛОВИЯ:
+            // 1. Нет аттрибута Follow-Up (или он false)
+            const isFollowUp = chat.custom_attributes?.[FOLLOW_UP_ATTR] === true;
+            // 2. Был изменен ДО сегодняшнего дня (вчера и ранее)
+            const isOldEnough = chat.updated_at < startOfTodayUnix;
 
-            if (!isFollowUp && wasUpdatedBeforeToday) {
-                // 1-minute snooze trick (unsnooze via re-snooze)
-                const oneMinUnix = Math.floor(Date.now() / 1000) + 60;
+            if (!isFollowUp && isOldEnough) {
+                log('ACTION', `Processing chat ${conv.id}`);
+
+                // Твой метод: Snooze на 1 минуту
+                const inOneMinute = Math.floor(Date.now() / 1000) + 60;
 
                 await intercomRequest('post', `/conversations/${conv.id}/reply`, {
                     message_type: 'snoozed',
                     admin_id: ADMIN_ID,
-                    snoozed_until: oneMinUnix
+                    snoozed_until: inOneMinute
                 });
 
-                // Send Note
+                // Отправка ноута
                 await intercomRequest('post', `/conversations/${conv.id}/reply`, {
                     message_type: 'note',
                     admin_id: ADMIN_ID,
@@ -116,49 +88,73 @@ async function processPresale() {
                 });
 
                 processedInSession.add(conv.id);
-                log('PRESALE', `Chat ${conv.id} resnoozed for 1m + note added`);
+                log('SUCCESS', `Chat ${conv.id} will wake up in 60s.`);
+            } else {
+                log('SKIP', `Chat ${conv.id} (FollowUp: ${isFollowUp}, Old: ${isOldEnough})`);
             }
         }
     } catch (e) {
-        log('PRESALE_ERR', e.message);
+        log('ERR_PRESALE', e.response?.data || e.message);
     }
 }
 
-// ================= WEBHOOK ENDPOINT =================
+// ================= LOGIC: DATA CHECK =================
+async function checkClientData(conversationId, contactId) {
+    try {
+        const res = await intercomRequest('get', `/contacts/${contactId}`);
+        const contact = res.data;
+
+        // Email Check
+        if (LIST_URL) {
+            const { data: list } = await axios.get(LIST_URL);
+            const emails = [contact.email, contact.custom_attributes?.['Purchase email']].filter(Boolean);
+            if (emails.some(e => list.some(l => l?.toLowerCase().trim() === e.toLowerCase().trim()))) {
+                await intercomRequest('put', `/contacts/${contactId}`, { custom_attributes: { [CUSTOM_ATTR_NAME]: true } });
+            }
+        }
+
+        // Sub Check
+        const sub = contact.custom_attributes?.Subscription || contact.custom_attributes?.subscription;
+        if (!sub) {
+            await intercomRequest('post', `/conversations/${conversationId}/reply`, {
+                message_type: 'note',
+                admin_id: ADMIN_ID,
+                body: 'Please fill subscription 😇'
+            });
+        }
+    } catch (e) {
+        log('ERR_DATA', e.message);
+    }
+}
+
+// ================= WEBHOOK =================
 app.post('/validate-email', async (req, res) => {
     const { topic, data } = req.body;
-    const item = data?.item;
+    if (!data?.item) return res.sendStatus(200);
 
-    if (!item) return res.sendStatus(200);
-
-    log('WEBHOOK', `Received topic: ${topic}`);
+    const item = data.item;
 
     try {
-        // Логика AWAY MODE
+        // ТРИГГЕР 1: Изменение статуса агента
         if (topic === 'admin.away_mode_updated') {
-            const isAway = item.away_mode_enabled;
-            log('AWAY_STATUS', `Natalie is now ${isAway ? 'AWAY' : 'ONLINE (Processing chats...)'}`);
-            
-            if (isAway === false) {
+            log('EVENT', `Away mode changed. Enabled: ${item.away_mode_enabled}`);
+            if (item.away_mode_enabled === false) {
                 await processPresale();
             }
         }
 
-        // Логика ЧАТОВ (Email & Subscription)
-        if (topic.startsWith('conversation.')) {
+        // ТРИГГЕР 2: Работа с данными (создание чата или ответ)
+        if (topic.includes('conversation')) {
             const contactId = item.contacts?.contacts?.[0]?.id || item.author?.id;
-            if (contactId) {
-                await checkContactData(item.id, contactId);
+            if (contactId && item.id) {
+                await checkClientData(item.id, contactId);
             }
         }
     } catch (e) {
-        log('GLOBAL_ERR', e.message);
+        log('ERR_GLOBAL', e.message);
     }
 
     res.sendStatus(200);
 });
 
-// Очистка сессии раз в сутки
-setInterval(() => processedInSession.clear(), 24 * 60 * 60 * 1000);
-
-app.listen(process.env.PORT || 3000, () => log('SYSTEM', 'Final Presale Engine Running'));
+app.listen(process.env.PORT || 3000, () => log('SYSTEM', 'Engine started. Looking for Presale chats...'));
