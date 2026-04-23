@@ -106,7 +106,7 @@ async function processPresale(adminId) {
                     value: [
                         { field: "team_assignee_id", operator: "=", value: PRESALE_TEAM_ID },
                         { field: "state", operator: "=", value: "snoozed" },
-                        { field: "snoozed_until", operator: "<", value: startOfTodayUnix }
+                        { field: "updated_at", operator: "<", value: startOfTodayUnix }
                     ]
                 },
                 pagination: { per_page: 20 }
