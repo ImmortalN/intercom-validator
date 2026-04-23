@@ -73,61 +73,85 @@ async function validateAndCheckSubscription(item) {
 
 // === ЛОГИКА 3: PRESALE (ОБНОВЛЕННАЯ) ===
 async function checkPresaleSnoozedChats() {
-    log('Запуск проверки Presale чатов по времени обновления...');
+    log('Запуск перевірки Presale чатів з пагінацією та team_assignee_id...');
     
-    // Начало сегодняшнего дня в Unix (UTC)
     const now = new Date();
     const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
     const startOfTodayUnix = Math.floor(startOfToday.getTime() / 1000);
 
+    let startingAfter = null; // Маркер для наступної сторінки
+
     try {
-        // Ищем чаты в снузе, обновленные ДО начала сегодняшнего дня
-        const searchRes = await axios.post('https://api.intercom.io/conversations/search', {
-            query: {
-                operator: 'AND',
-                value: [
-                    { field: 'state', operator: '=', value: 'snoozed' },
-                    { field: 'assignee_id', operator: '=', value: PRESALE_TEAM_ID },
-                    { field: 'updated_at', operator: '<', value: startOfTodayUnix }
-                ]
-            }
-        }, {
-            headers: { 'Authorization': `Bearer ${INTERCOM_TOKEN}`, 'Accept': 'application/json', 'Intercom-Version': INTERCOM_VERSION }
-        });
+        do {
+            // Формуємо тіло запиту
+            const searchBody = {
+                query: {
+                    operator: 'AND',
+                    value: [
+                        { field: 'state', operator: '=', value: 'snoozed' },
+                        // ЗМІНА 1: використовуємо team_assignee_id замість assignee_id
+                        { field: 'team_assignee_id', operator: '=', value: PRESALE_TEAM_ID },
+                        { field: 'updated_at', operator: '<', value: startOfTodayUnix }
+                    ]
+                },
+                pagination: { per_page: 50 } // ЗМІНА 2: додаємо ліміт на сторінку
+            };
 
-        const chats = searchRes.data.conversations || [];
-        log(`Найдено чатов для проверки: ${chats.length}`);
-
-        for (const chat of chats) {
-            // Проверяем Follow-Up аттрибут
-            const hasFollowUp = chat.custom_attributes?.[FOLLOW_UP_ATTR];
-            
-            if (hasFollowUp === true) {
-                log(`Чат ${chat.id} пропущен (Follow-Up: true)`);
-                continue;
+            // Якщо це не перша сторінка, додаємо маркер starting_after
+            if (startingAfter) {
+                searchBody.pagination.starting_after = startingAfter;
             }
 
-            // Отправляем ноут и переставляем снуз на 1 минуту (чтобы чат "всплыл")
-            try {
-                await axios.post(`https://api.intercom.io/conversations/${chat.id}/notes`, {
-                    admin_id: ADMIN_ID,
-                    body: PRESALE_NOTE_TEXT
-                }, { headers: { 'Authorization': `Bearer ${INTERCOM_TOKEN}`, 'Content-Type': 'application/json', 'Intercom-Version': INTERCOM_VERSION } });
+            const searchRes = await axios.post('https://api.intercom.io/conversations/search', searchBody, {
+                headers: { 
+                    'Authorization': `Bearer ${INTERCOM_TOKEN}`, 
+                    'Accept': 'application/json', 
+                    'Intercom-Version': INTERCOM_VERSION 
+                }
+            });
 
-                await axios.post(`https://api.intercom.io/conversations/${chat.id}/parts`, {
-                    message_type: 'note',
-                    admin_id: ADMIN_ID,
-                    action: 'snooze',
-                    snoozed_until: Math.floor(Date.now() / 1000) + 60
-                }, { headers: { 'Authorization': `Bearer ${INTERCOM_TOKEN}`, 'Content-Type': 'application/json', 'Intercom-Version': INTERCOM_VERSION } });
+            const chats = searchRes.data.conversations || [];
+            log(`Знайдено чатів на сторінці: ${chats.length}`);
 
-                log(`Чат ${chat.id} успешно обработан ноутом`);
-            } catch (e) {
-                log(`Ошибка при обработке чата ${chat.id}:`, e.message);
+            for (const chat of chats) {
+                // Перевірка Follow-Up (використовуємо тег або аттрибут, як у вашому проекті)
+                const hasFollowUp = chat.custom_attributes?.[FOLLOW_UP_ATTR];
+                
+                if (hasFollowUp === true) {
+                    log(`Чат ${chat.id} пропущено (Follow-Up: true)`);
+                    continue;
+                }
+
+                try {
+                    // Додаємо внутрішню замітку
+                    await axios.post(`https://api.intercom.io/conversations/${chat.id}/notes`, {
+                        admin_id: ADMIN_ID,
+                        body: PRESALE_NOTE_TEXT
+                    }, { headers: { 'Authorization': `Bearer ${INTERCOM_TOKEN}`, 'Content-Type': 'application/json', 'Intercom-Version': INTERCOM_VERSION } });
+
+                    // Переставляємо снуз на 1 хвилину
+                    await axios.post(`https://api.intercom.io/conversations/${chat.id}/parts`, {
+                        message_type: 'note',
+                        admin_id: ADMIN_ID,
+                        action: 'snooze',
+                        snoozed_until: Math.floor(Date.now() / 1000) + 60
+                    }, { headers: { 'Authorization': `Bearer ${INTERCOM_TOKEN}`, 'Content-Type': 'application/json', 'Intercom-Version': INTERCOM_VERSION } });
+
+                    log(`Чат ${chat.id} успішно оброблено`);
+                } catch (e) {
+                    log(`Помилка при обробці чату ${chat.id}:`, e.message);
+                }
             }
-        }
+
+            // Отримуємо маркер наступної сторінки з відповіді Intercom
+            startingAfter = searchRes.data.pages?.next?.starting_after;
+
+        } while (startingAfter); // Цикл триває, поки Intercom видає наступну сторінку
+
+        log('Перевірку всіх сторінок завершено.');
+
     } catch (err) {
-        log('Ошибка при поиске Presale чатов:', err.message);
+        log('Помилка при пошуку Presale чатів:', err.response?.data || err.message);
     }
 }
 
