@@ -22,7 +22,7 @@ function log(tag, message, data = '') {
     console.log(`[${tag}] ${message}`, data ? JSON.stringify(data) : '');
 }
 
-async function intercomRequest(method, url, data) {
+async function intercomRequest(method, url, data, customTimeout = 4000) {
     return axios({
         method,
         url: `https://api.intercom.io${url}`,
@@ -33,7 +33,7 @@ async function intercomRequest(method, url, data) {
             'Content-Type': 'application/json',
             'Accept': 'application/json'
         },
-        timeout: 4000 // Таймаут меньше 5 сек, чтобы не "повесить" лямбду Vercel
+        timeout: customTimeout // Теперь таймаут можно настраивать
     });
 }
 
@@ -98,6 +98,7 @@ async function processPresale(adminId) {
 
     log('PRESALE', `Starting scan for Admin ${adminId}...`);
     try {
+        // Увеличиваем таймаут для поиска до 15 секунд (15000ms)
         const searchRes = await intercomRequest('post', '/conversations/search', {
             query: {
                 operator: 'AND',
@@ -106,44 +107,54 @@ async function processPresale(adminId) {
                     { field: 'state', operator: '=', value: 'snoozed' }
                 ]
             }
-        });
+        }, 15000); 
 
         const conversations = searchRes.data.conversations || [];
+        log('PRESALE', `Found ${conversations.length} snoozed chats.`);
+
         const startOfTodayUnix = Math.floor(new Date().setHours(0, 0, 0, 0) / 1000);
 
         for (const conv of conversations) {
-            await sleep(150); // Небольшая задержка перед каждым чатом для обхода лимитов
+            try {
+                await sleep(200); // Немного увеличим паузу между чатами
 
-            const full = await intercomRequest('get', `/conversations/${conv.id}`);
-            const chat = full.data;
-            
-            const isFollowUp = chat.custom_attributes?.[FOLLOW_UP_ATTR] === true;
-            const isOldEnough = chat.updated_at < startOfTodayUnix;
-
-            if (!isFollowUp && isOldEnough) {
-                const inOneMinute = Math.floor(Date.now() / 1000) + 60;
+                // Для каждого отдельного чата тоже дадим 10 секунд на ответ
+                const full = await intercomRequest('get', `/conversations/${conv.id}`, null, 10000);
+                const chat = full.data;
                 
-                // ИСПРАВЛЕНО: Снуз через эндпоинт /reply
-                await intercomRequest('post', `/conversations/${conv.id}/reply`, {
-                    message_type: 'snoozed',
-                    admin_id: ADMIN_ID,
-                    snoozed_until: inOneMinute
-                });
+                const isFollowUp = chat.custom_attributes?.[FOLLOW_UP_ATTR] === true;
+                const isOldEnough = chat.updated_at < startOfTodayUnix;
 
-                // Отправка заметки
-                await intercomRequest('post', `/conversations/${conv.id}/reply`, {
-                    message_type: 'note',
-                    admin_id: ADMIN_ID,
-                    body: PRESALE_NOTE_TEXT
-                });
-                
-                log('ACTION', `Un-snoozed (via reply) and noted chat ${conv.id}`);
+                if (!isFollowUp && isOldEnough) {
+                    const inOneMinute = Math.floor(Date.now() / 1000) + 60;
+                    
+                    // Снуз
+                    await intercomRequest('post', `/conversations/${conv.id}/reply`, {
+                        message_type: 'snoozed',
+                        admin_id: ADMIN_ID,
+                        snoozed_until: inOneMinute
+                    }, 10000);
+
+                    // Заметка
+                    await intercomRequest('post', `/conversations/${conv.id}/reply`, {
+                        message_type: 'note',
+                        admin_id: ADMIN_ID,
+                        body: PRESALE_NOTE_TEXT
+                    }, 10000);
+                    
+                    log('ACTION', `Updated chat ${conv.id}`);
+                }
+            } catch (err) {
+                log('ERR_CHAT', `Failed to process chat ${conv.id}: ${err.message}`);
             }
         }
         
         lastProcessedDate.set(adminId, todayStr);
+        log('PRESALE', 'Finished processing all chats.');
         
-    } catch (e) { log('ERR_PRESALE', e.message); }
+    } catch (e) { 
+        log('ERR_PRESALE_SEARCH', e.message); 
+    }
 }
 
 // ================= VERCEL HANDLER =================
