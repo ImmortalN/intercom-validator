@@ -3,22 +3,21 @@ const axios = require('axios');
 const app = express();
 app.use(express.json());
 
-// === НАСТРОЙКИ (замените на свои или настройте в Environment Variables) ===
+// === НАСТРОЙКИ ===
 const INTERCOM_TOKEN = process.env.INTERCOM_TOKEN;
-const LIST_URL = process.env.LIST_URL; // API со списком email
+const LIST_URL = process.env.LIST_URL; 
 const PRESALE_TEAM_ID = process.env.PRESALE_TEAM_ID;
-const ADMIN_ID = process.env.ADMIN_ID; // ID админа, от имени которого пишутся ноуты
+const ADMIN_ID = process.env.ADMIN_ID; 
 const PRESALE_NOTE_TEXT = process.env.PRESALE_NOTE_TEXT || 'PRESALE_NOTE_TEXT';
 
 const INTERCOM_VERSION = '2.14';
 const FOLLOW_UP_ATTR = 'Follow-Up';
 const UNPAID_ATTR_NAME = 'Unpaid Custom';
 
-// Временное хранилище обработанных чатов за сегодня (ID чата -> Дата)
+// Хранилище обработанных чатов (ID -> Дата), чтобы не дублировать ноут в течение дня
 const processedToday = new Map();
 
-// --- Вспомогательные функции ---
-
+// --- Вспомогательная функция для запросов к API ---
 async function intercomApi(method, endpoint, data = {}) {
     return axios({
         method,
@@ -33,7 +32,7 @@ async function intercomApi(method, endpoint, data = {}) {
     });
 }
 
-// Проверка: наступил ли следующий календарный день для чата
+// Проверка: был ли чат обновлен вчера или ранее (следующий рабочий день)
 function isNextWorkingDay(updatedAt) {
     const lastUpdate = new Date(updatedAt * 1000);
     const now = new Date();
@@ -42,11 +41,10 @@ function isNextWorkingDay(updatedAt) {
     return now > lastUpdate;
 }
 
-// --- Основная логика Presale ---
-
-async function checkPresaleChats(adminId) {
+// --- Логика PRESALE (расснуживание + ноут) ---
+async function processPresaleChats(adminId) {
     try {
-        // Получаем снузнутые чаты команды
+        // 1. Ищем чаты команды Presale, которые сейчас в снузе
         const res = await intercomApi('get', `conversations?team_id=${PRESALE_TEAM_ID}&state=snoozed`);
         const conversations = res.data.conversations || [];
 
@@ -54,10 +52,9 @@ async function checkPresaleChats(adminId) {
             const convId = convSummary.id;
             const todayStr = new Date().toISOString().split('T')[0];
 
-            // Если уже обрабатывали этот чат сегодня — пропускаем
             if (processedToday.get(convId) === todayStr) continue;
 
-            // Получаем полные данные чата для проверки атрибутов и даты
+            // 2. Получаем полные данные чата
             const fullConv = await intercomApi('get', `conversations/${convId}`);
             const data = fullConv.data;
 
@@ -65,13 +62,16 @@ async function checkPresaleChats(adminId) {
             const isOldEnough = isNextWorkingDay(data.updated_at);
 
             if (!isFollowUp && isOldEnough) {
-                // 1. Расснуживаем
+                console.log(`[Presale] Обработка чата ${convId}...`);
+
+                // ШАГ 1: Принудительно открываем чат (Open). 
+                // Это выводит его из snooze. Клиент этого НЕ видит.
                 await intercomApi('post', `conversations/${convId}/reply`, {
                     message_type: 'open',
                     admin_id: adminId
                 });
 
-                // 2. Пишем ноут
+                // ШАГ 2: Добавляем внутреннюю заметку для агента
                 await intercomApi('post', `conversations/${convId}/reply`, {
                     message_type: 'note',
                     admin_id: adminId,
@@ -79,22 +79,21 @@ async function checkPresaleChats(adminId) {
                 });
 
                 processedToday.set(convId, todayStr);
-                console.log(`[Presale] Чат ${convId} успешно обработан.`);
+                console.log(`[SUCCESS] Чат ${convId} открыт и ноут добавлен.`);
             }
         }
     } catch (err) {
-        console.error('[Presale Error]', err.message);
+        console.error('[Presale Error]', err.response?.data || err.message);
     }
 }
 
-// --- Логика Email и Подписки ---
-
+// --- Логика EMAIL (Unpaid) и SUBSCRIPTION ---
 async function validateCustomer(contactId, convId) {
     try {
         const contactRes = await intercomApi('get', `contacts/${contactId}`);
         const contact = contactRes.data;
 
-        // 1. Проверка email по внешнему списку
+        // Проверка по внешнему списку email
         if (LIST_URL) {
             const listRes = await axios.get(LIST_URL);
             const emails = listRes.data || [];
@@ -105,7 +104,7 @@ async function validateCustomer(contactId, convId) {
             }
         }
 
-        // 2. Проверка поля subscription
+        // Ноут, если нет подписки
         if (!contact.custom_attributes?.subscription) {
             await intercomApi('post', `conversations/${convId}/reply`, {
                 message_type: 'note',
@@ -118,24 +117,24 @@ async function validateCustomer(contactId, convId) {
     }
 }
 
-// --- Webhook Handler ---
-
+// --- Обработчик Webhook ---
 app.post('/validate-email', async (req, res) => {
     const { topic, data } = req.body;
     const item = data?.item;
 
     if (!item) return res.sendStatus(200);
 
-    // ТРИГГЕР 1: Выход агента в онлайн (Логин или отключение Away Mode)
+    // Триггер: Админ залогинился ИЛИ отключил Away Mode
     const isLogin = (topic === 'admin.logged_in');
     const isBack = (topic === 'admin.away_mode_updated' && item.away_mode_enabled === false);
 
     if (isLogin || isBack) {
         const actingAdminId = item.id || item.admin_id;
-        checkPresaleChats(actingAdminId);
+        console.log(`[Trigger] Админ ${actingAdminId} онлайн. Запуск проверки Presale.`);
+        processPresaleChats(actingAdminId);
     }
 
-    // ТРИГГЕР 2: Новое сообщение (Проверка email и подписки)
+    // Триггер: Новое сообщение от пользователя
     if (topic === 'conversation.user.created' || topic === 'conversation.user.replied') {
         const contactId = item.contacts?.contacts?.[0]?.id || item.user?.id;
         if (contactId) validateCustomer(contactId, item.id);
@@ -144,8 +143,5 @@ app.post('/validate-email', async (req, res) => {
     res.status(200).send('OK');
 });
 
-// Для проверки работоспособности
-app.get('/', (req, res) => res.send('Validator is online!'));
-
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Server is running on port ${PORT}`));
