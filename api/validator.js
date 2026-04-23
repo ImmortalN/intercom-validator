@@ -16,54 +16,39 @@ function log(tag, message, data = '') {
     console.log(`[${tag}] ${message}`, data ? JSON.stringify(data) : '');
 }
 
-// Универсальный запрос
-async function intercomRequest(method, url, data, customTimeout = 15000, retryCount = 0) {
-    try {
-        return await axios({
-            method,
-            url: `https://api.intercom.io${url}`,
-            data,
-            headers: {
-                'Authorization': `Bearer ${INTERCOM_TOKEN}`,
-                'Intercom-Version': INTERCOM_VERSION,
-                'Content-Type': 'application/json',
-                'Accept': 'application/json'
-            },
-            timeout: customTimeout
-        });
-    } catch (error) {
-        if (error.response?.status === 429 && retryCount < 3) {
-            const delay = Math.pow(2, retryCount) * 2000;
-            log('RATE_LIMIT', `Retrying in ${delay}ms...`);
-            await sleep(delay);
-            return intercomRequest(method, url, data, customTimeout, retryCount + 1);
-        }
-        throw error;
-    }
+// Универсальный запрос с увеличенным таймаутом
+async function intercomRequest(method, url, data, customTimeout = 25000) {
+    return await axios({
+        method,
+        url: `https://api.intercom.io${url}`,
+        data,
+        headers: {
+            'Authorization': `Bearer ${INTERCOM_TOKEN}`,
+            'Intercom-Version': INTERCOM_VERSION,
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+        },
+        timeout: customTimeout
+    });
 }
 
-// ================= LOGIC: PRESALE ENGINE (TARGETED SEARCH) =================
+// ================= LOGIC: PRESALE ENGINE (V3 - TARGETED + CURSOR) =================
 async function processPresale(adminId) {
-    const today = new Date();
-    const todayStr = today.toISOString().split('T')[0];
-    
+    const todayStr = new Date().toISOString().split('T')[0];
     if (lastProcessedDate.get(adminId) === todayStr) {
         log('PRESALE', `Admin ${adminId} already processed today.`);
         return;
     }
 
-    // Полночь сегодняшнего дня в Unix (UTC)
     const startOfTodayUnix = Math.floor(new Date().setHours(0, 0, 0, 0) / 1000);
+    log('PRESALE', `Starting targeted scan for Team ${PRESALE_TEAM_ID}`);
 
-    log('PRESALE', `Starting targeted scan for Presale Team. Filters: Snoozed & Until < ${startOfTodayUnix}`);
-    
-    let pagination = { per_page: 30 }; 
+    let startingAfter = null;
 
     try {
-        while (pagination) {
-            // ВОЗВРАЩАЕМ СЛОЖНЫЙ ФИЛЬТР (AND)
-            // Это заставляет Intercom искать только в маленькой кучке ваших чатов
-            const searchRes = await intercomRequest('post', '/conversations/search', {
+        do {
+            // Формируем тело запроса как в старом коде
+            const searchBody = {
                 query: {
                     operator: "AND",
                     value: [
@@ -72,58 +57,61 @@ async function processPresale(adminId) {
                         { field: "snoozed_until", operator: "<", value: startOfTodayUnix }
                     ]
                 },
-                pagination: pagination
-            }, 20000); // 20 сек таймаут
+                pagination: { per_page: 20 } // Маленький размер страницы для скорости
+            };
 
+            if (startingAfter) {
+                searchBody.pagination.starting_after = startingAfter;
+            }
+
+            log('DEBUG', `Fetching page... Cursor: ${startingAfter || 'START'}`);
+            
+            const searchRes = await intercomRequest('post', '/conversations/search', searchBody);
             const chats = searchRes.data.conversations || [];
-            log('PRESALE', `Found ${chats.length} matching chats on this page.`);
+
+            log('PRESALE', `Found ${chats.length} chats on this page.`);
 
             for (const conv of chats) {
                 try {
-                    // Важный нюанс: Search API не всегда отдает кастомные атрибуты сразу.
-                    // Проверяем Follow-Up через детальный запрос чата.
+                    // Проверяем Follow-Up (через детальный запрос, так надежнее)
                     const chatRes = await intercomRequest('get', `/conversations/${conv.id}`);
                     const chat = chatRes.data;
 
                     if (chat.custom_attributes?.[FOLLOW_UP_ATTR] !== true) {
                         const inOneMinute = Math.floor(Date.now() / 1000) + 60;
                         
-                        // 1. Продлеваем снуз на 1 минуту
+                        // Снуз на 1 минуту
                         await intercomRequest('post', `/conversations/${conv.id}/reply`, {
                             message_type: 'snoozed', 
                             admin_id: ADMIN_ID, 
                             snoozed_until: inOneMinute
                         });
 
-                        // 2. Добавляем заметку
+                        // Внутренняя заметка
                         await intercomRequest('post', `/conversations/${conv.id}/reply`, {
                             message_type: 'note', 
                             admin_id: ADMIN_ID, 
                             body: PRESALE_NOTE_TEXT
                         });
-                        log('ACTION', `Chat ${conv.id} processed.`);
+                        log('ACTION', `Chat ${conv.id} woken up.`);
                     }
-                    await sleep(300); // Защита от лимитов
+                    await sleep(400); // Плавная работа, чтобы не забанили
                 } catch (err) {
                     log('CHAT_ERR', `Skip ${conv.id}: ${err.message}`);
                 }
             }
 
-            if (searchRes.data.pages?.next) {
-                pagination = { 
-                    per_page: 30, 
-                    starting_after: searchRes.data.pages.next.starting_after 
-                };
-            } else {
-                pagination = null;
-            }
-        }
-        
+            // Обновляем курсор для следующей страницы
+            startingAfter = searchRes.data.pages?.next?.starting_after;
+
+        } while (startingAfter);
+
         lastProcessedDate.set(adminId, todayStr);
-        log('PRESALE', 'Scan complete.');
-        
-    } catch (e) { 
-        log('SEARCH_FATAL', `Search failed: ${e.message}`); 
+        log('PRESALE', 'Success: All pages processed.');
+
+    } catch (e) {
+        log('SEARCH_FATAL', `Search failed: ${e.message}`);
+        // Если даже целевой запрос падает, возможно проблема в таймауте самого Vercel (10с на бесплатном тарифе)
     }
 }
 
@@ -134,6 +122,7 @@ module.exports = async (req, res) => {
     const body = req.body;
     if (!body?.data?.item) return res.status(200).json({ ok: true });
 
+    // Моментальный ответ для Intercom
     res.status(200).json({ ok: true });
 
     const topic = body.topic;
@@ -141,7 +130,8 @@ module.exports = async (req, res) => {
 
     try {
         if (topic === 'admin.away_mode_updated' && data.item.away_mode_enabled === false) {
-            log('WEBHOOK', `Admin ${data.item.id} is BACK. Triggering targeted scan...`);
+            log('WEBHOOK', `Admin ${data.item.id} BACK online.`);
+            // Запуск процесса без await, чтобы не тормозить вебхук
             processPresale(data.item.id).catch(e => log('ASYNC_ERR', e.message));
         }
     } catch (e) {
