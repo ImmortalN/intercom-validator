@@ -183,28 +183,44 @@ async function updateContactAttribute(contactId, attributes) {
 
 // === WEBHOOK ===
 app.post('/validate-email', async (req, res) => {
-    const { topic, data } = req.body;
-    const item = data?.item;
-    if (!item) return res.sendStatus(200);
+    const body = req.body;
+    const topic = body.topic;
+    const item = body.data?.item;
 
-    // 1. Presale Logic
-    if (topic === 'admin.logged_in' || (topic === 'admin.away_mode_updated' && item.away_mode_enabled === false)) {
-        processSnoozedForAdmin(item.id);
+    if (!item) return res.status(200).json({ ok: true });
+
+    // ЛОГ ДЛЯ ОТЛАДКИ ( Natalie увидит его в консоли сервера )
+    console.log(`[WEBHOOK] Topic: ${topic} | Item ID: ${item.id}`);
+
+    // 1. ПРОВЕРКА ОНЛАЙН-СТАТУСА ( Natalie заходит в Intercom )
+    if (topic === 'admin.logged_in' || topic === 'admin.away_mode_updated') {
+        const isAway = item.away_mode_enabled ?? item.away_mode?.enabled;
+        
+        if (isAway === false) {
+            console.log(`[PRESALE TRIGGER] Админ ${item.id} в онлайне. Проверяем старые чаты...`);
+            processSnoozedForAdmin(item.id); 
+        }
+        return res.status(200).json({ ok: true });
     }
 
-    // 2. Transfer from Bot
+    // 2. ПЕРЕВОД ИЗ БОТА ( Когда бот отдал чат человеку )
     if (topic === 'conversation.admin.assigned') {
+        const conversationId = item.id; // В этом топике ID чата обычно в item.id
         const prev = item.previous_assignee;
-        if (prev?.type === 'bot' && !processedTransferConversations.has(item.id)) {
-            processedTransferConversations.add(item.id);
-            await addNoteWithDelay(item.id, 'Чат передано з бота на команду presale/support', 2000, ADMIN_ID);
+        
+        if (prev?.type === 'bot' && !processedTransferConversations.has(conversationId)) {
+            processedTransferConversations.add(conversationId);
+            await addNoteWithDelay(conversationId, 'Чат передано з бота на команду presale/support', 2000, ADMIN_ID);
         }
     }
 
-    // 3. User messages
+    // 3. НОВОЕ СООБЩЕНИЕ ( Проверка Email и Unpaid Custom )
     if (topic === 'conversation.user.replied' || topic === 'conversation.user.created') {
         const contactId = item.contacts?.contacts?.[0]?.id || item.author?.id;
-        validateAndSetCustom(contactId, item.id);
+        const conversationId = item.id;
+        
+        console.log(`[USER MSG] Проверка атрибутов для чата: ${conversationId}`);
+        validateAndSetCustom(contactId, conversationId);
     }
 
     res.status(200).json({ ok: true });
