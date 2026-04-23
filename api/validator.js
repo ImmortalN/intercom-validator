@@ -2,12 +2,10 @@ const axios = require('axios');
 
 // === ENV & CONSTANTS ===
 const INTERCOM_TOKEN = process.env.INTERCOM_TOKEN;
-const LIST_URL = process.env.LIST_URL;
 const ADMIN_ID = process.env.ADMIN_ID;
 const PRESALE_TEAM_ID = process.env.PRESALE_TEAM_ID;
 const INTERCOM_VERSION = '2.14';
 
-const CUSTOM_ATTR_NAME = process.env.CUSTOM_ATTR_NAME || 'Unpaid Custom';
 const FOLLOW_UP_ATTR = 'Follow-Up';
 const PRESALE_NOTE_TEXT = process.env.PRESALE_NOTE_TEXT || 'Агент вийшов в онлайн — перевіряємо чати presale 😎';
 
@@ -18,8 +16,8 @@ function log(tag, message, data = '') {
     console.log(`[${tag}] ${message}`, data ? JSON.stringify(data) : '');
 }
 
-// Универсальный запрос с экспоненциальным backoff и кастомным таймаутом
-async function intercomRequest(method, url, data, customTimeout = 10000, retryCount = 0) {
+// Универсальный запрос
+async function intercomRequest(method, url, data, customTimeout = 15000, retryCount = 0) {
     try {
         return await axios({
             method,
@@ -34,88 +32,86 @@ async function intercomRequest(method, url, data, customTimeout = 10000, retryCo
             timeout: customTimeout
         });
     } catch (error) {
-        // Если таймаут (ECONNABORTED) или 429 (лимиты)
-        const isTimeout = error.code === 'ECONNABORTED';
-        const isRateLimit = error.response?.status === 429;
-
-        if ((isTimeout || isRateLimit) && retryCount < 3) {
-            const delay = Math.pow(2, retryCount) * 2000; // 2s, 4s, 8s
-            log('RETRY', `Reason: ${isTimeout ? 'Timeout' : 'Rate Limit'}. Retrying in ${delay}ms...`);
+        if (error.response?.status === 429 && retryCount < 3) {
+            const delay = Math.pow(2, retryCount) * 2000;
+            log('RATE_LIMIT', `Retrying in ${delay}ms...`);
             await sleep(delay);
-            // При таймауте увеличиваем время ожидания в следующей попытке
-            return intercomRequest(method, url, data, customTimeout + 10000, retryCount + 1);
+            return intercomRequest(method, url, data, customTimeout, retryCount + 1);
         }
         throw error;
     }
 }
 
-// ================= LOGIC: PRESALE ENGINE (FIXED TIMEOUT) =================
+// ================= LOGIC: PRESALE ENGINE (TARGETED SEARCH) =================
 async function processPresale(adminId) {
-    const todayStr = new Date().toISOString().split('T')[0];
+    const today = new Date();
+    const todayStr = today.toISOString().split('T')[0];
+    
     if (lastProcessedDate.get(adminId) === todayStr) {
         log('PRESALE', `Admin ${adminId} already processed today.`);
         return;
     }
 
-    log('PRESALE', `Starting scan for Admin ${adminId}`);
-    
-    // УМЕНЬШАЕМ per_page для стабильности
-    let pagination = { per_page: 20 }; 
+    // Полночь сегодняшнего дня в Unix (UTC)
     const startOfTodayUnix = Math.floor(new Date().setHours(0, 0, 0, 0) / 1000);
+
+    log('PRESALE', `Starting targeted scan for Presale Team. Filters: Snoozed & Until < ${startOfTodayUnix}`);
+    
+    let pagination = { per_page: 30 }; 
 
     try {
         while (pagination) {
-            log('DEBUG', `Fetching page with starting_after: ${pagination.starting_after || 'START'}`);
-            
-            // Используем увеличенный таймаут для поиска (30 секунд)
+            // ВОЗВРАЩАЕМ СЛОЖНЫЙ ФИЛЬТР (AND)
+            // Это заставляет Intercom искать только в маленькой кучке ваших чатов
             const searchRes = await intercomRequest('post', '/conversations/search', {
                 query: {
-                    field: 'state',
-                    operator: '=',
-                    value: 'snoozed'
+                    operator: "AND",
+                    value: [
+                        { field: "team_assignee_id", operator: "=", value: PRESALE_TEAM_ID },
+                        { field: "state", operator: "=", value: "snoozed" },
+                        { field: "snoozed_until", operator: "<", value: startOfTodayUnix }
+                    ]
                 },
                 pagination: pagination
-            }, 30000); 
+            }, 20000); // 20 сек таймаут
 
-            const allSnoozed = searchRes.data.conversations || [];
-            
-            const presaleChats = allSnoozed.filter(conv => 
-                conv.team_assignee_id === PRESALE_TEAM_ID
-            );
+            const chats = searchRes.data.conversations || [];
+            log('PRESALE', `Found ${chats.length} matching chats on this page.`);
 
-            log('PRESALE', `Found ${presaleChats.length} presale chats on page (Total snoozed in batch: ${allSnoozed.length})`);
-
-            for (const conv of presaleChats) {
+            for (const conv of chats) {
                 try {
-                    await sleep(500); // Чуть увеличил паузу, чтобы не спамить API
-                    
+                    // Важный нюанс: Search API не всегда отдает кастомные атрибуты сразу.
+                    // Проверяем Follow-Up через детальный запрос чата.
                     const chatRes = await intercomRequest('get', `/conversations/${conv.id}`);
                     const chat = chatRes.data;
-                    
-                    if (chat.custom_attributes?.[FOLLOW_UP_ATTR] !== true && chat.updated_at < startOfTodayUnix) {
+
+                    if (chat.custom_attributes?.[FOLLOW_UP_ATTR] !== true) {
                         const inOneMinute = Math.floor(Date.now() / 1000) + 60;
                         
+                        // 1. Продлеваем снуз на 1 минуту
                         await intercomRequest('post', `/conversations/${conv.id}/reply`, {
                             message_type: 'snoozed', 
                             admin_id: ADMIN_ID, 
                             snoozed_until: inOneMinute
                         });
 
+                        // 2. Добавляем заметку
                         await intercomRequest('post', `/conversations/${conv.id}/reply`, {
                             message_type: 'note', 
                             admin_id: ADMIN_ID, 
                             body: PRESALE_NOTE_TEXT
                         });
-                        log('ACTION', `Snoozed & noted chat ${conv.id}`);
+                        log('ACTION', `Chat ${conv.id} processed.`);
                     }
+                    await sleep(300); // Защита от лимитов
                 } catch (err) {
-                    log('CHAT_ERR', `Chat ${conv.id} skip: ${err.message}`);
+                    log('CHAT_ERR', `Skip ${conv.id}: ${err.message}`);
                 }
             }
 
             if (searchRes.data.pages?.next) {
                 pagination = { 
-                    per_page: 20, 
+                    per_page: 30, 
                     starting_after: searchRes.data.pages.next.starting_after 
                 };
             } else {
@@ -124,10 +120,10 @@ async function processPresale(adminId) {
         }
         
         lastProcessedDate.set(adminId, todayStr);
-        log('PRESALE', 'Success: All pages processed.');
+        log('PRESALE', 'Scan complete.');
         
     } catch (e) { 
-        log('SEARCH_FATAL', `Critical failure: ${e.message}`); 
+        log('SEARCH_FATAL', `Search failed: ${e.message}`); 
     }
 }
 
@@ -145,8 +141,7 @@ module.exports = async (req, res) => {
 
     try {
         if (topic === 'admin.away_mode_updated' && data.item.away_mode_enabled === false) {
-            log('WEBHOOK', `Admin ${data.item.id} returned. Running Presale check...`);
-            // Запускаем асинхронно, чтобы не держать ответ вебхука
+            log('WEBHOOK', `Admin ${data.item.id} is BACK. Triggering targeted scan...`);
             processPresale(data.item.id).catch(e => log('ASYNC_ERR', e.message));
         }
     } catch (e) {
