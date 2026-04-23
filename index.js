@@ -228,54 +228,55 @@ async function processPresale(adminId) {
 
 // ================= WEBHOOK =================
 app.post('/validate-email', async (req, res) => {
-  const body = req.body;
-  const topic = body.topic;
-  const item = body.data?.item;
+  // ⚠️ СРАЗУ ОТДАЁМ ОТВЕТ INTERCOM
+  res.sendStatus(200);
 
-  if (!item) return res.sendStatus(200);
+  // ВСЁ ДАЛЬНЕЙШЕЕ — АСИНХРОННО
+  setImmediate(async () => {
+    try {
+      const body = req.body;
+      const topic = body.topic;
+      const item = body.data?.item;
 
-  const conversationId = item.id;
-  const contactId =
-    item.contacts?.contacts?.[0]?.id ||
-    item.author?.id;
+      console.log('🔥 WEBHOOK RECEIVED:', topic);
 
-  try {
-    // ================= PRESALE TRIGGER =================
-    if (topic === 'admin.away_mode_updated') {
-      const isAway = item.away_mode_enabled;
+      if (!item) return;
 
-      updateAdminState(item.id, isAway);
+      const conversationId = item.id;
+      const contactId =
+        item.contacts?.contacts?.[0]?.id ||
+        item.author?.id;
 
-      if (
-        isAway === false && // вышел из away mode
-        isFirstExitToday(item.id) // первый раз сегодня
-      ) {
-        await processPresale(item.id);
+      // ================= PRESALE =================
+      if (topic === 'admin.away_mode_updated') {
+        const isAway = item.away_mode_enabled;
+
+        updateAdminState(item.id, isAway);
+
+        if (isAway === false && isFirstExitToday(item.id)) {
+          await processPresale(item.id);
+        }
       }
 
-      return res.sendStatus(200);
+      // ================= EMAIL =================
+      if (contactId) {
+        await validateEmail(contactId);
+      }
+
+      // ================= SUBSCRIPTION =================
+      if (conversationId && contactId) {
+        const contact = await intercomRequest(
+          'get',
+          `/contacts/${contactId}`
+        );
+
+        await checkSubscription(conversationId, contact.data);
+      }
+
+    } catch (e) {
+      console.error('🔥 ASYNC WEBHOOK ERROR:', e.message);
     }
-
-    // ================= EMAIL =================
-    if (contactId) {
-      await validateEmail(contactId);
-    }
-
-    // ================= SUBSCRIPTION =================
-    if (conversationId && contactId) {
-      const contact = await intercomRequest(
-        'get',
-        `/contacts/${contactId}`
-      );
-
-      await checkSubscription(conversationId, contact.data);
-    }
-
-    res.sendStatus(200);
-  } catch (e) {
-    console.error('[WEBHOOK ERROR]', e.message);
-    res.sendStatus(200);
-  }
+  });
 });
 
 // ================= START =================
