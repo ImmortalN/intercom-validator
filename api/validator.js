@@ -12,8 +12,11 @@ const FOLLOW_UP_ATTR = 'Follow-Up';
 const PRESALE_NOTE_TEXT = process.env.PRESALE_NOTE_TEXT || 'Агент вийшов в онлайн — перевіряємо чати presale 😎';
 const SUB_REMINDER_TEXT = 'Please fill subscription 😇';
 
-// Хранилище для защиты от повторных запусков за один день (в рамках жизни сервера)
-const lastProcessedDate = new Map(); // adminId -> YYYY-MM-DD
+// Хранилище для защиты от повторных запусков за один день
+const lastProcessedDate = new Map();
+
+// Утилита для паузы (Rate Limiting)
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 function log(tag, message, data = '') {
     console.log(`[${tag}] ${message}`, data ? JSON.stringify(data) : '');
@@ -29,7 +32,8 @@ async function intercomRequest(method, url, data) {
             'Intercom-Version': INTERCOM_VERSION,
             'Content-Type': 'application/json',
             'Accept': 'application/json'
-        }
+        },
+        timeout: 4000 // Таймаут меньше 5 сек, чтобы не "повесить" лямбду Vercel
     });
 }
 
@@ -41,7 +45,6 @@ async function checkClientData(conversationId, contactId) {
         const convRes = await intercomRequest('get', `/conversations/${conversationId}`);
         const conversation = convRes.data;
 
-        // Проверяем, нет ли уже заметки про подписку
         const hasAlreadyNotified = conversation.conversation_parts?.conversation_parts.some(
             part => part.body && part.body.includes(SUB_REMINDER_TEXT)
         );
@@ -54,7 +57,7 @@ async function checkClientData(conversationId, contactId) {
         const contactRes = await intercomRequest('get', `/contacts/${contactId}`);
         const contact = contactRes.data;
 
-        // 1. Проверка Email (Unpaid Custom)
+        // 1. Проверка Email
         if (LIST_URL) {
             try {
                 const { data: list } = await axios.get(LIST_URL);
@@ -87,10 +90,9 @@ async function checkClientData(conversationId, contactId) {
 
 // ================= LOGIC: PRESALE ENGINE =================
 async function processPresale(adminId) {
-    // Защита: запускаем только 1 раз в календарный день для этого админа
     const todayStr = new Date().toISOString().split('T')[0];
     if (lastProcessedDate.get(adminId) === todayStr) {
-        log('PRESALE', `Admin ${adminId} already processed today. Skipping.`);
+        log('PRESALE', `Admin ${adminId} already processed today.`);
         return;
     }
 
@@ -110,6 +112,8 @@ async function processPresale(adminId) {
         const startOfTodayUnix = Math.floor(new Date().setHours(0, 0, 0, 0) / 1000);
 
         for (const conv of conversations) {
+            await sleep(150); // Небольшая задержка перед каждым чатом для обхода лимитов
+
             const full = await intercomRequest('get', `/conversations/${conv.id}`);
             const chat = full.data;
             
@@ -117,25 +121,26 @@ async function processPresale(adminId) {
             const isOldEnough = chat.updated_at < startOfTodayUnix;
 
             if (!isFollowUp && isOldEnough) {
-                // Метод 1-минутного снуза
                 const inOneMinute = Math.floor(Date.now() / 1000) + 60;
                 
-                await intercomRequest('post', `/conversations/${conv.id}/snooze`, {
+                // ИСПРАВЛЕНО: Снуз через эндпоинт /reply
+                await intercomRequest('post', `/conversations/${conv.id}/reply`, {
+                    message_type: 'snoozed',
                     admin_id: ADMIN_ID,
                     snoozed_until: inOneMinute
                 });
 
+                // Отправка заметки
                 await intercomRequest('post', `/conversations/${conv.id}/reply`, {
                     message_type: 'note',
                     admin_id: ADMIN_ID,
                     body: PRESALE_NOTE_TEXT
                 });
                 
-                log('ACTION', `Updated snooze and sent note for chat ${conv.id}`);
+                log('ACTION', `Un-snoozed (via reply) and noted chat ${conv.id}`);
             }
         }
         
-        // Запоминаем, что на сегодня закончили
         lastProcessedDate.set(adminId, todayStr);
         
     } catch (e) { log('ERR_PRESALE', e.message); }
@@ -143,7 +148,6 @@ async function processPresale(adminId) {
 
 // ================= VERCEL HANDLER =================
 module.exports = async (req, res) => {
-    // Обработка HEAD запросов от Intercom
     if (req.method === 'HEAD') return res.status(200).send('OK');
 
     const body = req.body;
@@ -153,21 +157,18 @@ module.exports = async (req, res) => {
     if (!item) return res.status(200).json({ ok: true });
 
     try {
-        // 1. Логика AWAY MODE (Presale Trigger)
         if (topic === 'admin.away_mode_updated') {
             const adminId = item.id;
             const isAway = item.away_mode_enabled;
 
-            console.log(`[WEBHOOK] Статус агента змінено: ID ${adminId}, Away Mode: ${isAway}`);
+            console.log(`[WEBHOOK] Статус агента: ID ${adminId}, Away: ${isAway}`);
 
             if (isAway === false) {
-                console.log(`[ACTION] Агент ${adminId} повернувся! Запускаю перевірку Presale чатів...`);
-                await processPresale(adminId);
+                // Выполняем асинхронно, чтобы не держать webhook ответ
+                processPresale(adminId).catch(e => log('ASYNC_ERR', e.message));
             }
         }
 
-        // 2. Логика ASSIGNED (Unpaid & Subscription)
-        // Срабатывает, когда чат передается на агента или команду
         if (topic === 'conversation.admin.assigned') {
             const contactId = item.contacts?.contacts?.[0]?.id;
             const conversationId = item.id;
@@ -181,5 +182,6 @@ module.exports = async (req, res) => {
         log('GLOBAL_ERR', e.message);
     }
 
+    // Всегда отвечаем 200 быстро
     res.status(200).json({ ok: true });
 };
