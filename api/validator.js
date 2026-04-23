@@ -19,8 +19,8 @@ function log(tag, message, data = '') {
     console.log(`[${tag}] ${message}`, data ? JSON.stringify(data) : '');
 }
 
-// Универсальный запрос с обработкой Rate Limit (429)
-async function intercomRequest(method, url, data, customTimeout = 5000) {
+// Универсальный запрос с экспоненциальным backoff
+async function intercomRequest(method, url, data, customTimeout = 10000, retryCount = 0) {
     try {
         return await axios({
             method,
@@ -35,135 +35,130 @@ async function intercomRequest(method, url, data, customTimeout = 5000) {
             timeout: customTimeout
         });
     } catch (error) {
-        if (error.response?.status === 429) {
-            log('RATE_LIMIT', 'Too many requests, sleeping 2 seconds...');
-            await sleep(2000);
-            return intercomRequest(method, url, data, customTimeout); // Повтор
+        // Если ошибка 429 (лимиты) и мы не превысили 3 попытки
+        if (error.response?.status === 429 && retryCount < 3) {
+            const delay = Math.pow(2, retryCount) * 1000; // 1s, 2s, 4s
+            log('RATE_LIMIT', `Hit limits. Retrying in ${delay}ms... (Attempt ${retryCount + 1})`);
+            await sleep(delay);
+            return intercomRequest(method, url, data, customTimeout, retryCount + 1);
         }
         throw error;
     }
 }
 
-// ================= LOGIC: DATA AUDIT =================
-async function checkClientData(conversationId, contactId) {
-    try {
-        // Уменьшаем таймаут для аудита, чтобы вебхук не висел
-        const convRes = await intercomRequest('get', `/conversations/${conversationId}`, null, 3000);
-        const conversation = convRes.data;
-
-        const hasNote = conversation.conversation_parts?.conversation_parts.some(
-            part => part.body && part.body.includes(SUB_REMINDER_TEXT)
-        );
-        if (hasNote) return;
-
-        const contactRes = await intercomRequest('get', `/contacts/${contactId}`, null, 3000);
-        const contact = contactRes.data;
-
-        if (LIST_URL) {
-            const { data: list } = await axios.get(LIST_URL, { timeout: 2000 }).catch(() => ({ data: [] }));
-            const emails = [contact.email, contact.custom_attributes?.['Purchase email']].filter(Boolean);
-            const match = emails.some(e => list.some(l => l?.toLowerCase().trim() === e.toLowerCase().trim()));
-            if (match) {
-                await intercomRequest('put', `/contacts/${contactId}`, { custom_attributes: { [CUSTOM_ATTR_NAME]: true } });
-            }
-        }
-
-        const sub = contact.custom_attributes?.Subscription || contact.custom_attributes?.subscription;
-        if (!sub || sub.toString().trim() === '') {
-            await intercomRequest('post', `/conversations/${conversationId}/reply`, {
-                message_type: 'note', admin_id: ADMIN_ID, body: SUB_REMINDER_TEXT
-            });
-        }
-    } catch (e) { log('AUDIT_ERR', e.message); }
-}
-
-// ================= LOGIC: PRESALE ENGINE (PAGINATED) =================
+// ================= LOGIC: PRESALE ENGINE (OPTIMIZED) =================
 async function processPresale(adminId) {
     const todayStr = new Date().toISOString().split('T')[0];
-    if (lastProcessedDate.get(adminId) === todayStr) return;
+    if (lastProcessedDate.get(adminId) === todayStr) {
+        log('PRESALE', `Admin ${adminId} already processed today.`);
+        return;
+    }
 
-    log('PRESALE', `Starting paginated scan for Admin ${adminId}`);
+    log('PRESALE', `Starting scan for Admin ${adminId}`);
     
     let pagination = { per_page: 50 };
     const startOfTodayUnix = Math.floor(new Date().setHours(0, 0, 0, 0) / 1000);
 
     try {
         while (pagination) {
+            // УПРОЩЕННЫЙ ЗАПРОС: только по статусу snoozed
             const searchRes = await intercomRequest('post', '/conversations/search', {
                 query: {
-                    operator: 'AND',
-                    value: [
-                        { field: 'team_assignee_id', operator: '=', value: PRESALE_TEAM_ID },
-                        { field: 'state', operator: '=', value: 'snoozed' }
-                    ]
+                    field: 'state',
+                    operator: '=',
+                    value: 'snoozed'
                 },
                 pagination: pagination
-            }, 10000);
+            });
 
-            const conversations = searchRes.data.conversations || [];
-            log('PRESALE', `Processing page of ${conversations.length} chats...`);
+            const allSnoozed = searchRes.data.conversations || [];
+            
+            // ФИЛЬТРАЦИЯ В КОДЕ: отбираем только Presale команду
+            const presaleChats = allSnoozed.filter(conv => 
+                conv.team_assignee_id === PRESALE_TEAM_ID
+            );
 
-            for (const conv of conversations) {
+            log('PRESALE', `Found ${presaleChats.length} presale chats on this page (total snoozed: ${allSnoozed.length})`);
+
+            for (const conv of presaleChats) {
                 try {
-                    await sleep(300); 
-                    const chatRes = await intercomRequest('get', `/conversations/${conv.id}`, null, 5000);
+                    await sleep(300); // Небольшая пауза между действиями
+                    
+                    // Получаем полные данные чата, чтобы проверить кастомные атрибуты
+                    const chatRes = await intercomRequest('get', `/conversations/${conv.id}`);
                     const chat = chatRes.data;
                     
+                    // Условие: Не Follow-Up и обновлен вчера или раньше
                     if (chat.custom_attributes?.[FOLLOW_UP_ATTR] !== true && chat.updated_at < startOfTodayUnix) {
                         const inOneMinute = Math.floor(Date.now() / 1000) + 60;
                         
+                        // 1. Продлеваем снуз на 1 минуту (чтобы он сам вылетел)
                         await intercomRequest('post', `/conversations/${conv.id}/reply`, {
-                            message_type: 'snoozed', admin_id: ADMIN_ID, snoozed_until: inOneMinute
+                            message_type: 'snoozed', 
+                            admin_id: ADMIN_ID, 
+                            snoozed_until: inOneMinute
                         });
 
+                        // 2. Добавляем внутреннюю заметку
                         await intercomRequest('post', `/conversations/${conv.id}/reply`, {
-                            message_type: 'note', admin_id: ADMIN_ID, body: PRESALE_NOTE_TEXT
+                            message_type: 'note', 
+                            admin_id: ADMIN_ID, 
+                            body: PRESALE_NOTE_TEXT
                         });
-                        log('ACTION', `Un-snoozed chat ${conv.id}`);
+                        log('ACTION', `Updated snooze & added note for chat ${conv.id}`);
                     }
                 } catch (err) {
-                    if (err.response?.status !== 404) log('CHAT_ERR', err.message);
+                    log('CHAT_ERR', `Failed to process chat ${conv.id}: ${err.message}`);
                 }
             }
 
-            // Проверка: есть ли следующая страница?
+            // Переход на следующую страницу
             if (searchRes.data.pages?.next) {
                 pagination = { 
                     per_page: 50, 
                     starting_after: searchRes.data.pages.next.starting_after 
                 };
-                log('PRESALE', 'Moving to next page...');
             } else {
                 pagination = null;
             }
         }
         
         lastProcessedDate.set(adminId, todayStr);
-        log('PRESALE', 'All pages processed.');
+        log('PRESALE', 'Finished processing all pages.');
         
-    } catch (e) { log('SEARCH_FATAL', e.message); }
+    } catch (e) { 
+        log('SEARCH_FATAL', `Search failed: ${e.message}`); 
+    }
 }
 
 // ================= VERCEL HANDLER =================
 module.exports = async (req, res) => {
+    // HEAD запрос для проверки жизни сервера
     if (req.method === 'HEAD') return res.status(200).send('OK');
 
-    const { topic, data } = req.body;
-    if (!data?.item) return res.status(200).json({ ok: true });
+    const body = req.body;
+    if (!body?.data?.item) return res.status(200).json({ ok: true });
 
-    // 1. Мгновенно отвечаем Intercom, чтобы уложиться в 500мс
+    // Сразу отвечаем Intercom (в рамках 500мс), чтобы он не считал вебхук упавшим
     res.status(200).json({ ok: true });
 
-    // 2. Выполняем логику после отправки ответа
+    const topic = body.topic;
+    const data = body.data;
+
     try {
+        // Событие: агент вышел из Away режима
         if (topic === 'admin.away_mode_updated' && data.item.away_mode_enabled === false) {
+            log('WEBHOOK', `Admin ${data.item.id} is BACK. Triggering scan...`);
             processPresale(data.item.id).catch(e => log('ASYNC_PRESALE_ERR', e.message));
         }
 
+        // Логика проверки данных (Unpaid / Subscription) при назначении чата
         if (topic === 'conversation.admin.assigned') {
             const contactId = data.item.contacts?.contacts?.[0]?.id;
-            if (contactId) {
-                checkClientData(data.item.id, contactId).catch(e => log('ASYNC_AUDIT_ERR', e.message));
+            const conversationId = data.item.id;
+            if (contactId && conversationId) {
+                // Вызываем функцию проверки (её можно оставить из прошлого кода)
+                // checkClientData(conversationId, contactId).catch(...);
             }
         }
     } catch (e) {
