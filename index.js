@@ -2,6 +2,12 @@ const express = require('express');
 const axios = require('axios');
 const app = express();
 app.use(express.json());
+// === ГЛОБАЛЬНЫЙ ЛОГГЕР (Ставить СЮДА) ===
+// Он покажет абсолютно любой запрос, который пришел на ваш сервер
+app.use((req, res, next) => {
+    console.log(`[GLOBAL LOG] ${new Date().toISOString()} | ${req.method} ${req.url} | IP: ${req.ip}`);
+    next();
+});
 
 // === ПЕРЕМЕННЫЕ ===
 const INTERCOM_TOKEN = process.env.INTERCOM_TOKEN;
