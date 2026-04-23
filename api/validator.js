@@ -12,187 +12,161 @@ const FOLLOW_UP_ATTR = 'Follow-Up';
 const PRESALE_NOTE_TEXT = process.env.PRESALE_NOTE_TEXT || 'Агент вийшов в онлайн — перевіряємо чати presale 😎';
 const SUB_REMINDER_TEXT = 'Please fill subscription 😇';
 
-// Хранилище для защиты от повторных запусков за один день
 const lastProcessedDate = new Map();
-
-// Утилита для паузы (Rate Limiting)
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 function log(tag, message, data = '') {
     console.log(`[${tag}] ${message}`, data ? JSON.stringify(data) : '');
 }
 
-async function intercomRequest(method, url, data, customTimeout = 4000) {
-    return axios({
-        method,
-        url: `https://api.intercom.io${url}`,
-        data,
-        headers: {
-            'Authorization': `Bearer ${INTERCOM_TOKEN}`,
-            'Intercom-Version': INTERCOM_VERSION,
-            'Content-Type': 'application/json',
-            'Accept': 'application/json'
-        },
-        timeout: customTimeout // Теперь таймаут можно настраивать
-    });
+// Универсальный запрос с обработкой Rate Limit (429)
+async function intercomRequest(method, url, data, customTimeout = 5000) {
+    try {
+        return await axios({
+            method,
+            url: `https://api.intercom.io${url}`,
+            data,
+            headers: {
+                'Authorization': `Bearer ${INTERCOM_TOKEN}`,
+                'Intercom-Version': INTERCOM_VERSION,
+                'Content-Type': 'application/json',
+                'Accept': 'application/json'
+            },
+            timeout: customTimeout
+        });
+    } catch (error) {
+        if (error.response?.status === 429) {
+            log('RATE_LIMIT', 'Too many requests, sleeping 2 seconds...');
+            await sleep(2000);
+            return intercomRequest(method, url, data, customTimeout); // Повтор
+        }
+        throw error;
+    }
 }
 
-// ================= LOGIC: DATA AUDIT (EMAIL & SUB) =================
+// ================= LOGIC: DATA AUDIT =================
 async function checkClientData(conversationId, contactId) {
     try {
-        log('AUDIT', `Checking data for conv ${conversationId}`);
-        
-        const convRes = await intercomRequest('get', `/conversations/${conversationId}`);
+        // Уменьшаем таймаут для аудита, чтобы вебхук не висел
+        const convRes = await intercomRequest('get', `/conversations/${conversationId}`, null, 3000);
         const conversation = convRes.data;
 
-        const hasAlreadyNotified = conversation.conversation_parts?.conversation_parts.some(
+        const hasNote = conversation.conversation_parts?.conversation_parts.some(
             part => part.body && part.body.includes(SUB_REMINDER_TEXT)
         );
+        if (hasNote) return;
 
-        if (hasAlreadyNotified) {
-            log('AUDIT', 'Subscription note already exists, skipping.');
-            return;
-        }
-
-        const contactRes = await intercomRequest('get', `/contacts/${contactId}`);
+        const contactRes = await intercomRequest('get', `/contacts/${contactId}`, null, 3000);
         const contact = contactRes.data;
 
-        // 1. Проверка Email
         if (LIST_URL) {
-            try {
-                const { data: list } = await axios.get(LIST_URL);
-                const emails = [contact.email, contact.custom_attributes?.['Purchase email']].filter(Boolean);
-                const match = emails.some(e => list.some(l => l?.toLowerCase().trim() === e.toLowerCase().trim()));
-                
-                if (match) {
-                    await intercomRequest('put', `/contacts/${contactId}`, { 
-                        custom_attributes: { [CUSTOM_ATTR_NAME]: true } 
-                    });
-                    log('AUDIT', `Marked ${contactId} as Unpaid`);
-                }
-            } catch (err) { log('ERR_LIST', err.message); }
+            const { data: list } = await axios.get(LIST_URL, { timeout: 2000 }).catch(() => ({ data: [] }));
+            const emails = [contact.email, contact.custom_attributes?.['Purchase email']].filter(Boolean);
+            const match = emails.some(e => list.some(l => l?.toLowerCase().trim() === e.toLowerCase().trim()));
+            if (match) {
+                await intercomRequest('put', `/contacts/${contactId}`, { custom_attributes: { [CUSTOM_ATTR_NAME]: true } });
+            }
         }
 
-        // 2. Проверка подписки
         const sub = contact.custom_attributes?.Subscription || contact.custom_attributes?.subscription;
         if (!sub || sub.toString().trim() === '') {
             await intercomRequest('post', `/conversations/${conversationId}/reply`, {
-                message_type: 'note',
-                admin_id: ADMIN_ID,
-                body: SUB_REMINDER_TEXT
+                message_type: 'note', admin_id: ADMIN_ID, body: SUB_REMINDER_TEXT
             });
-            log('AUDIT', `Sent reminder to ${conversationId}`);
         }
-    } catch (e) {
-        log('ERR_AUDIT', e.message);
-    }
+    } catch (e) { log('AUDIT_ERR', e.message); }
 }
 
-// ================= LOGIC: PRESALE ENGINE =================
+// ================= LOGIC: PRESALE ENGINE (PAGINATED) =================
 async function processPresale(adminId) {
     const todayStr = new Date().toISOString().split('T')[0];
-    if (lastProcessedDate.get(adminId) === todayStr) {
-        log('PRESALE', `Admin ${adminId} already processed today.`);
-        return;
-    }
+    if (lastProcessedDate.get(adminId) === todayStr) return;
 
-    log('PRESALE', `Starting scan for Admin ${adminId}...`);
+    log('PRESALE', `Starting paginated scan for Admin ${adminId}`);
+    
+    let pagination = { per_page: 50 };
+    const startOfTodayUnix = Math.floor(new Date().setHours(0, 0, 0, 0) / 1000);
+
     try {
-        // Увеличиваем таймаут для поиска до 15 секунд (15000ms)
-        const searchRes = await intercomRequest('post', '/conversations/search', {
-            query: {
-                operator: 'AND',
-                value: [
-                    { field: 'team_assignee_id', operator: '=', value: PRESALE_TEAM_ID },
-                    { field: 'state', operator: '=', value: 'snoozed' }
-                ]
-            }
-        }, 15000); 
+        while (pagination) {
+            const searchRes = await intercomRequest('post', '/conversations/search', {
+                query: {
+                    operator: 'AND',
+                    value: [
+                        { field: 'team_assignee_id', operator: '=', value: PRESALE_TEAM_ID },
+                        { field: 'state', operator: '=', value: 'snoozed' }
+                    ]
+                },
+                pagination: pagination
+            }, 10000);
 
-        const conversations = searchRes.data.conversations || [];
-        log('PRESALE', `Found ${conversations.length} snoozed chats.`);
+            const conversations = searchRes.data.conversations || [];
+            log('PRESALE', `Processing page of ${conversations.length} chats...`);
 
-        const startOfTodayUnix = Math.floor(new Date().setHours(0, 0, 0, 0) / 1000);
-
-        for (const conv of conversations) {
-            try {
-                await sleep(200); // Немного увеличим паузу между чатами
-
-                // Для каждого отдельного чата тоже дадим 10 секунд на ответ
-                const full = await intercomRequest('get', `/conversations/${conv.id}`, null, 10000);
-                const chat = full.data;
-                
-                const isFollowUp = chat.custom_attributes?.[FOLLOW_UP_ATTR] === true;
-                const isOldEnough = chat.updated_at < startOfTodayUnix;
-
-                if (!isFollowUp && isOldEnough) {
-                    const inOneMinute = Math.floor(Date.now() / 1000) + 60;
+            for (const conv of conversations) {
+                try {
+                    await sleep(300); 
+                    const chatRes = await intercomRequest('get', `/conversations/${conv.id}`, null, 5000);
+                    const chat = chatRes.data;
                     
-                    // Снуз
-                    await intercomRequest('post', `/conversations/${conv.id}/reply`, {
-                        message_type: 'snoozed',
-                        admin_id: ADMIN_ID,
-                        snoozed_until: inOneMinute
-                    }, 10000);
+                    if (chat.custom_attributes?.[FOLLOW_UP_ATTR] !== true && chat.updated_at < startOfTodayUnix) {
+                        const inOneMinute = Math.floor(Date.now() / 1000) + 60;
+                        
+                        await intercomRequest('post', `/conversations/${conv.id}/reply`, {
+                            message_type: 'snoozed', admin_id: ADMIN_ID, snoozed_until: inOneMinute
+                        });
 
-                    // Заметка
-                    await intercomRequest('post', `/conversations/${conv.id}/reply`, {
-                        message_type: 'note',
-                        admin_id: ADMIN_ID,
-                        body: PRESALE_NOTE_TEXT
-                    }, 10000);
-                    
-                    log('ACTION', `Updated chat ${conv.id}`);
+                        await intercomRequest('post', `/conversations/${conv.id}/reply`, {
+                            message_type: 'note', admin_id: ADMIN_ID, body: PRESALE_NOTE_TEXT
+                        });
+                        log('ACTION', `Un-snoozed chat ${conv.id}`);
+                    }
+                } catch (err) {
+                    if (err.response?.status !== 404) log('CHAT_ERR', err.message);
                 }
-            } catch (err) {
-                log('ERR_CHAT', `Failed to process chat ${conv.id}: ${err.message}`);
+            }
+
+            // Проверка: есть ли следующая страница?
+            if (searchRes.data.pages?.next) {
+                pagination = { 
+                    per_page: 50, 
+                    starting_after: searchRes.data.pages.next.starting_after 
+                };
+                log('PRESALE', 'Moving to next page...');
+            } else {
+                pagination = null;
             }
         }
         
         lastProcessedDate.set(adminId, todayStr);
-        log('PRESALE', 'Finished processing all chats.');
+        log('PRESALE', 'All pages processed.');
         
-    } catch (e) { 
-        log('ERR_PRESALE_SEARCH', e.message); 
-    }
+    } catch (e) { log('SEARCH_FATAL', e.message); }
 }
 
 // ================= VERCEL HANDLER =================
 module.exports = async (req, res) => {
     if (req.method === 'HEAD') return res.status(200).send('OK');
 
-    const body = req.body;
-    const topic = body.topic;
-    const item = body.data?.item;
+    const { topic, data } = req.body;
+    if (!data?.item) return res.status(200).json({ ok: true });
 
-    if (!item) return res.status(200).json({ ok: true });
+    // 1. Мгновенно отвечаем Intercom, чтобы уложиться в 500мс
+    res.status(200).json({ ok: true });
 
+    // 2. Выполняем логику после отправки ответа
     try {
-        if (topic === 'admin.away_mode_updated') {
-            const adminId = item.id;
-            const isAway = item.away_mode_enabled;
-
-            console.log(`[WEBHOOK] Статус агента: ID ${adminId}, Away: ${isAway}`);
-
-            if (isAway === false) {
-                // Выполняем асинхронно, чтобы не держать webhook ответ
-                processPresale(adminId).catch(e => log('ASYNC_ERR', e.message));
-            }
+        if (topic === 'admin.away_mode_updated' && data.item.away_mode_enabled === false) {
+            processPresale(data.item.id).catch(e => log('ASYNC_PRESALE_ERR', e.message));
         }
 
         if (topic === 'conversation.admin.assigned') {
-            const contactId = item.contacts?.contacts?.[0]?.id;
-            const conversationId = item.id;
-
-            if (contactId && conversationId) {
-                await checkClientData(conversationId, contactId);
+            const contactId = data.item.contacts?.contacts?.[0]?.id;
+            if (contactId) {
+                checkClientData(data.item.id, contactId).catch(e => log('ASYNC_AUDIT_ERR', e.message));
             }
         }
-
     } catch (e) {
-        log('GLOBAL_ERR', e.message);
+        log('HANDLER_ERR', e.message);
     }
-
-    // Всегда отвечаем 200 быстро
-    res.status(200).json({ ok: true });
 };
