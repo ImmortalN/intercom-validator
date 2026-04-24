@@ -5,7 +5,7 @@ app.use(express.json());
 
 // === CONFIGURATION ===
 const INTERCOM_TOKEN = process.env.INTERCOM_TOKEN;
-const ADMIN_ID = process.env.ADMIN_ID; // Системный ID для отправки ноутов
+const ADMIN_ID = process.env.ADMIN_ID; 
 const PRESALE_TEAM_ID = process.env.PRESALE_TEAM_ID;
 const PRESALE_NOTE_TEXT = process.env.PRESALE_NOTE_TEXT || 'Агент вийшов в онлайн — перевіряємо заснужені чати presale 🚀';
 const INTERCOM_VERSION = '2.14';
@@ -14,14 +14,13 @@ const INTERCOM_VERSION = '2.14';
 const lastProcessedDate = new Map();
 let isPresaleRunning = false;
 
-// === HELPER: LOGGING ===
 function log(tag, message) {
   const ts = new Date().toISOString().replace('T', ' ').split('.')[0];
   console.log(`[${ts}] [${tag}] ${message}`);
 }
 
-// === HELPER: INTERCOM API CLIENT WITH RETRY & RATE LIMIT ===
-async function intercomApi(method, endpoint, data = null, timeout = 5000) {
+// === HELPER: INTERCOM API CLIENT WITH RETRY ===
+async function intercomApi(method, endpoint, data = null, timeout = 7000) {
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
       const res = await axios({
@@ -37,20 +36,16 @@ async function intercomApi(method, endpoint, data = null, timeout = 5000) {
         timeout
       });
 
-      // Защита от лимитов (Rate Limit)
-      const remaining = res.headers['x-ratelimit-remaining'];
-      if (remaining && parseInt(remaining) < 5) {
-        log('RATE-LIMIT', 'Критически мало лимитов Intercom, пауза 5 сек...');
-        await new Promise(r => setTimeout(r, 5000));
-      }
-
       return res.data;
     } catch (error) {
-      const isTimeout = error.code === 'ECONNABORTED' || error.message.includes('timeout');
-      if (isTimeout && attempt < 2) {
-        log('RETRY', `Таймаут на ${endpoint}, попытка №2... (ждем 2 сек)`);
-        await new Promise(r => setTimeout(r, 2000));
-        continue;
+      if (error.code === 'ECONNABORTED') {
+        log('TIMEOUT', `Таймаут на ${endpoint} (${timeout}ms). Попытка ${attempt}/2...`);
+        if (attempt < 2) {
+          await new Promise(r => setTimeout(r, 1000));
+          continue;
+        }
+      } else {
+        log('API-ERROR', `Сбой ${endpoint}: ${error.response?.status} - ${error.message}`);
       }
       throw error;
     }
@@ -60,62 +55,56 @@ async function intercomApi(method, endpoint, data = null, timeout = 5000) {
 // === PRESALE CORE LOGIC ===
 async function handlePresale(adminId) {
   if (isPresaleRunning) {
-    log('SKIP', 'Процесс пресейла уже запущен, пропускаем дубликат.');
+    log('SKIP', 'Процесс уже запущен, пропускаем.');
     return;
   }
 
   const today = new Date().toISOString().split('T')[0];
   if (lastProcessedDate.get(adminId) === today) {
-    log('SKIP', `Админ ${adminId} уже обрабатывался сегодня (${today}).`);
+    log('SKIP', `Админ ${adminId} уже обрабатывался сегодня.`);
     return;
   }
 
   isPresaleRunning = true;
-  log('START', `Начинаем поиск чатов для админа ${adminId}`);
+  log('START', `Поиск чатов для админа ${adminId}`);
 
   try {
     const todayMidnightUnix = Math.floor(new Date().setHours(0, 0, 0, 0) / 1000);
-    log('INFO', `Полночь сегодня (Unix): ${todayMidnightUnix}`);
+    log('INFO', `Полночь (Unix): ${todayMidnightUnix}`);
     
-    // ЛЕГКИЙ ПОИСК: Запрашиваем только статус snoozed (50 чатов, таймаут 15 секунд)
-    log('API-CALL', `Отправляем запрос на поиск чатов...`);
+    // ПРАВИЛЬНЫЙ СОСТАВНОЙ ЗАПРОС (как просил Intercom AI)
+    log('API-CALL', `Отправляем составной запрос на поиск...`);
     const search = await intercomApi('post', '/conversations/search', {
       query: {
-        field: 'state', 
-        operator: '=', 
-        value: 'snoozed'
+        operator: 'AND',
+        value: [
+          { field: 'state', operator: '=', value: 'snoozed' },
+          { field: 'team_assignee_id', operator: '=', value: Number(PRESALE_TEAM_ID) }
+        ]
       },
-      pagination: { per_page: 50 } 
-    }, 15000); 
+      pagination: { per_page: 20 } 
+    }, 8000); // 8 секунд на ответ
 
     const conversations = search?.conversations || [];
-    log('INFO', `Intercom вернул снузнутых чатов всего: ${conversations.length}`);
+    log('INFO', `Найдено чатов в команде Presale: ${conversations.length}`);
 
-    // ФИЛЬТРАЦИЯ НА СТОРОНЕ СЕРВЕРА
     const toProcess = conversations.filter(c => {
-      const isPresaleTeam = String(c.team_assignee_id) === String(PRESALE_TEAM_ID);
       const lastAdmin = c.statistics?.last_admin_reply_at || 0;
       const lastContact = c.statistics?.last_contact_reply_at || 0;
       const noFollowUp = c.custom_attributes?.['Follow-Up'] !== true;
       
       const isOld = lastAdmin < todayMidnightUnix && lastContact < todayMidnightUnix;
 
-      // Детальный лог для дебага каждого чата из пресейл команды
-      if (isPresaleTeam) {
-         log('DEBUG-CHAT', `Чат ${c.id} | isOld: ${isOld} | noFollowUp: ${noFollowUp}`);
-      }
-
-      return isPresaleTeam && isOld && noFollowUp;
+      log('DEBUG-CHAT', `Чат ${c.id} | isOld: ${isOld} | noFollowUp: ${noFollowUp}`);
+      return isOld && noFollowUp;
     });
 
-    log('INFO', `Итого чатов, подходящих под условия пресейла: ${toProcess.length}`);
+    log('INFO', `Итого чатов для обработки: ${toProcess.length}`);
 
-    // ОБРАБОТКА ЧАТОВ
     for (const conv of toProcess) {
-      log('ACTION', `Начинаем расснуживать чат ${conv.id} и писать ноут...`);
+      log('ACTION', `Снуз + Ноут для чата ${conv.id}`);
       
-      // Выполняем снуз и ноут параллельно для экономии времени
-      const [snoozeRes, noteRes] = await Promise.allSettled([
+      await Promise.allSettled([
         intercomApi('post', `/conversations/${conv.id}/reply`, {
           message_type: 'snoozed',
           admin_id: ADMIN_ID,
@@ -128,57 +117,52 @@ async function handlePresale(adminId) {
         })
       ]);
       
-      log('RESULT', `Чат ${conv.id} -> Snooze: ${snoozeRes.status} | Note: ${noteRes.status}`);
-      await new Promise(r => setTimeout(r, 1000)); // Пауза в 1 сек между разными чатами
+      await new Promise(r => setTimeout(r, 500)); // Короткая пауза для стабильности
     }
 
     lastProcessedDate.set(adminId, today);
-    log('SUCCESS', `Логика пресейла успешно завершена для админа ${adminId}`);
+    log('SUCCESS', `Логика пресейла завершена для ${adminId}`);
   } catch (e) {
-    log('FATAL', `Критическая ошибка логики пресейла: ${e.message}`);
+    log('FATAL', `Ошибка пресейла: ${e.message}`);
   } finally {
     isPresaleRunning = false;
   }
 }
 
-// === WEBHOOK HANDLER ===
-app.post('/validate-email', (req, res) => {
+// === WEBHOOK HANDLER (СИНХРОННЫЙ ДЛЯ VERCEL) ===
+app.post('/validate-email', async (req, res) => {
   const { topic, data } = req.body || {};
-  
-  // 1. МГНОВЕННЫЙ ЛОГ И ОТВЕТ
   log('WEBHOOK-RCV', `Получено событие: ${topic || 'unknown'}`);
-  res.status(200).send('OK');
 
-  // 2. АСИНХРОННАЯ ОБРАБОТКА (чтобы не блокировать Intercom)
-  setImmediate(() => {
-    try {
-      if (topic === 'admin.away_mode_updated') {
-        const item = data?.item;
-        if (!item) return;
+  try {
+    if (topic === 'admin.away_mode_updated') {
+      const item = data?.item;
+      if (!item) return res.status(200).send('OK');
 
-        const isAway = item.away_mode_enabled ?? item.away_mode?.enabled;
+      const isAway = item.away_mode_enabled ?? item.away_mode?.enabled;
+      
+      if (isAway === false) {
+        log('ACTION', `Админ ${item.id} вернулся (Away Mode OFF).`);
         
-        if (isAway === false) {
-          log('ACTION', `Админ ${item.id} вернулся (Away Mode OFF). Запускаем код!`);
-          handlePresale(item.id).catch(err => log('ASYNC-ERR', err.message));
-        } else {
-          log('INFO', `Админ ${item.id} ушел (Away Mode ON). Ничего не делаем.`);
-        }
+        // В VERCEL МЫ ОБЯЗАНЫ ЖДАТЬ ЗАВЕРШЕНИЯ, ИНАЧЕ КОД УМРЕТ
+        await handlePresale(item.id);
+      } else {
+        log('INFO', `Админ ${item.id} ушел (Away Mode ON). Пропускаем.`);
       }
-    } catch (err) {
-      log('GLOBAL-ERR', `Ошибка в обработчике вебхука: ${err.message}`);
     }
-  });
+  } catch (err) {
+    log('GLOBAL-ERR', `Сбой обработки вебхука: ${err.message}`);
+  }
+
+  // Отвечаем Intercom только после завершения всех дел!
+  res.status(200).send('OK');
 });
 
-// === HEALTH CHECK ===
 app.get('/', (req, res) => res.send('Presale Engine is Active 🚀'));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log('==============================================');
-  console.log(`SERVER STARTED ON PORT ${PORT} - MONITORING ACTIVE`);
-  console.log('==============================================');
+  console.log(`SERVER STARTED ON PORT ${PORT}`);
 });
 
-module.exports = app; // Для поддержки Vercel
+module.exports = app;
