@@ -20,7 +20,7 @@ function log(tag, message) {
   console.log(`[${timestamp}] [${tag}] ${message}`);
 }
 
-// === HELPER: API REQUEST WITH RETRY & TIMEOUT ===
+// === HELPER: API REQUEST WITH RETRY ===
 async function intercomRequest(method, endpoint, data = null, customTimeout = 15000) {
   try {
     const config = {
@@ -38,24 +38,25 @@ async function intercomRequest(method, endpoint, data = null, customTimeout = 15
     const response = await axios(config);
     return response.data;
   } catch (error) {
-    const errorMsg = error.response?.data ? JSON.stringify(error.response.data) : error.message;
-    log('API-ERROR', `${method.toUpperCase()} ${endpoint} -> ${errorMsg}`);
+    const errorData = error.response?.data ? JSON.stringify(error.response.data) : error.message;
+    log('API-ERROR', `${method.toUpperCase()} ${endpoint} -> ${errorData}`);
     throw error;
   }
 }
 
-async function intercomRequestWithRetry(method, endpoint, data = null, retries = 2, customTimeout = 15000) {
+async function intercomRequestWithRetry(method, endpoint, data = null, retries = 2, customTimeout = 20000) {
   for (let i = 0; i <= retries; i++) {
     try {
-      // Додаємо невелику затримку між запитами для захисту від rate limit
-      await new Promise(resolve => setTimeout(resolve, 150));
+      await new Promise(resolve => setTimeout(resolve, 300)); // Rate limit protection
       return await intercomRequest(method, endpoint, data, customTimeout);
     } catch (error) {
+      const isRateLimit = error.response?.status === 429;
       const isTimeout = error.code === 'ECONNABORTED' || error.message.includes('timeout');
-      if (i === retries || !isTimeout) throw error;
       
-      const delay = 1000 * Math.pow(2, i); // Експоненціальний бекофф
-      log('RETRY', `Attempt ${i + 1} failed. Retrying in ${delay}ms...`);
+      if (i === retries || (!isRateLimit && !isTimeout)) throw error;
+      
+      const delay = isRateLimit ? 5000 : 2000 * Math.pow(2, i);
+      log('RETRY', `Issue on ${endpoint}. Retrying in ${delay}ms... (Attempt ${i + 1})`);
       await new Promise(resolve => setTimeout(resolve, delay));
     }
   }
@@ -63,84 +64,75 @@ async function intercomRequestWithRetry(method, endpoint, data = null, retries =
 
 // === LOGIC 1 & 2: UNPAID & SUBSCRIPTION ===
 async function validateContactData(contactId, conversationId) {
-  log('START', `Processing contact ${contactId} in chat ${conversationId}`);
   try {
     const conversation = await intercomRequestWithRetry('get', `/conversations/${conversationId}`);
-    const assignee = conversation.assignee;
-    
-    if (assignee?.type === 'bot' || assignee?.id?.startsWith('bot_')) {
-      log('SKIP', `Chat ${conversationId} is with bot.`);
-      return;
-    }
+    if (conversation.assignee?.type === 'bot') return;
 
     const contact = await intercomRequestWithRetry('get', `/contacts/${contactId}`);
+    
+    // Unpaid
     const email = contact.email;
-    const purchaseEmail = contact.custom_attributes?.['Purchase Email'];
-
-    // Unpaid logic
-    if (email || purchaseEmail) {
-      const listRes = await axios.get(LIST_URL);
-      const unpaidList = listRes.data;
-      if (unpaidList.includes(email) || (purchaseEmail && unpaidList.includes(purchaseEmail))) {
-        log('ACTION', `Unpaid match! Updating contact ${contactId}`);
+    const pEmail = contact.custom_attributes?.['Purchase Email'];
+    if (email || pEmail) {
+      const list = (await axios.get(LIST_URL)).data;
+      if (list.includes(email) || list.includes(pEmail)) {
         await intercomRequestWithRetry('put', `/contacts/${contactId}`, {
           custom_attributes: { 'Unpaid Custom': true }
         });
+        log('ACTION', `Updated Unpaid status for ${contactId}`);
       }
     }
 
-    // Subscription logic
-    const subValue = contact.custom_attributes?.['subscription'];
-    if (!subValue || subValue.trim() === '') {
-      log('ACTION', `Subscription empty. Adding note to ${conversationId}`);
+    // Subscription
+    if (!contact.custom_attributes?.['subscription']?.trim()) {
       await intercomRequestWithRetry('post', `/conversations/${conversationId}/reply`, {
-        message_type: 'note',
-        admin_id: ADMIN_ID,
-        body: 'Заповніть будь ласка subscription 😇🙏'
+        message_type: 'note', admin_id: ADMIN_ID, body: 'Заповніть будь ласка subscription 😇🙏'
       });
+      log('ACTION', `Sent sub note to ${conversationId}`);
     }
   } catch (err) {
-    log('ERROR-VAL', `Validation failed: ${err.message}`);
+    log('ERROR-VAL', err.message);
   }
 }
 
 // === LOGIC 3: PRESALE ===
 async function checkPresaleSnoozedChats(adminId) {
   const today = new Date().toISOString().split('T')[0];
-  if (lastProcessedDate.get(adminId) === today) {
-    log('PRESALE-SKIP', `Admin ${adminId} already processed today.`);
-    return;
-  }
+  if (lastProcessedDate.get(adminId) === today) return;
+
+  log('PRESALE-START', `Processing for admin ${adminId}`);
 
   try {
     const startOfTodayUnix = Math.floor(new Date().setHours(0, 0, 0, 0) / 1000);
     
-    log('PRESALE-SEARCH', `Searching chats (30s timeout)...`);
-    // Пошук з великим таймаутом
+    // Пошук з пагінацією та великим таймаутом
     const searchResult = await intercomRequestWithRetry('post', '/conversations/search', {
-      query: { field: 'state', operator: '=', value: 'snoozed' }
-    }, 2, 30000);
+      query: { field: 'state', operator: '=', value: 'snoozed' },
+      pagination: { per_page: 50 }
+    }, 2, 40000);
 
     const conversations = searchResult.conversations || [];
-    let count = 0;
+    log('PRESALE-INFO', `Found ${conversations.length} snoozed chats.`);
 
     for (const conv of conversations) {
-      const isPresale = conv.team_assignee_id === PRESALE_TEAM_ID;
-      const isOld = conv.updated_at < startOfTodayUnix;
-      const isBlocked = conv.custom_attributes?.['Follow-Up'] === true;
-
-      if (isPresale && isOld && !isBlocked) {
-        log('ACTION', `Waking up chat ${conv.id}`);
+      // ПЕРЕВІРКА: чи чат належить команді і чи він "старий"
+      if (conv.team_assignee_id === PRESALE_TEAM_ID && conv.updated_at < startOfTodayUnix) {
         
-        // КРОК 1: Пробудження (snooze_until)
+        if (conv.custom_attributes?.['Follow-Up'] === true) {
+          log('PRESALE-SKIP', `Chat ${conv.id} has Follow-Up active.`);
+          continue;
+        }
+
+        log('ACTION', `Waking up & noting chat ${conv.id}`);
+
+        // КРОК 1: Пробудження (Параметр snooze_until - БЕЗ 'd')
         await intercomRequestWithRetry('post', `/conversations/${conv.id}/reply`, {
           message_type: 'snoozed',
           admin_id: adminId,
           snooze_until: Math.floor(Date.now() / 1000) + 60
         });
 
-        // Пауза для стабільності
-        await new Promise(resolve => setTimeout(resolve, 800));
+        await new Promise(resolve => setTimeout(resolve, 1000)); // Більша пауза для стабільності
 
         // КРОК 2: Нотатка
         await intercomRequestWithRetry('post', `/conversations/${conv.id}/reply`, {
@@ -149,46 +141,40 @@ async function checkPresaleSnoozedChats(adminId) {
           body: PRESALE_NOTE_TEXT
         });
 
-        count++;
-        // Додаткова пауза між різними чатами для уникнення лімітів
-        await new Promise(resolve => setTimeout(resolve, 200));
+        await new Promise(resolve => setTimeout(resolve, 500)); 
       }
     }
 
     lastProcessedDate.set(adminId, today);
-    log('SUCCESS', `Processed ${count} presale chats.`);
+    log('SUCCESS', `Presale check finished.`);
   } catch (err) {
-    log('ERROR-PRESALE', `Presale check failed: ${err.message}`);
+    log('ERROR-PRESALE', `Check failed: ${err.message}`);
   }
 }
 
 // === ROUTES ===
 
-app.get('/', (req, res) => res.send('Active'));
+app.get('/', (req, res) => res.send('Server is Up'));
 app.get('/favicon.ico', (req, res) => res.status(204).end());
 
 app.post('/validate-email', (req, res) => {
-  // 1. Миттєва відповідь для Intercom
-  res.sendStatus(200);
+  res.sendStatus(200); // Відповідаємо відразу
 
-  // 2. Обробка у фоні
   const { topic, data } = req.body;
-  const item = data?.item;
+  if (!data?.item) return;
 
-  if (!item) return;
-
+  const item = data.item;
   log('WEBHOOK-RCV', `Topic: ${topic}, ID: ${item.id}`);
 
-  // Виконуємо асинхронно
+  // Асинхронний запуск
   (async () => {
     try {
       if (topic === 'conversation.user.created' || topic === 'conversation.user.replied') {
-        const contactId = item.contacts?.contacts?.[0]?.id || item.source?.author?.id;
-        if (contactId) await validateContactData(contactId, item.id);
+        const cId = item.contacts?.contacts?.[0]?.id || item.source?.author?.id;
+        if (cId) await validateContactData(cId, item.id);
       }
 
       if (topic === 'admin.away_mode_updated' && item.away_mode_enabled === false) {
-        log('INFO', `Admin ${item.id} online. Triggering presale check.`);
         await checkPresaleSnoozedChats(item.id);
       }
     } catch (e) {
@@ -198,4 +184,4 @@ app.post('/validate-email', (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => log('SYSTEM', `Server running on port ${PORT}`));
+app.listen(PORT, () => log('SYSTEM', `Server started on ${PORT}`));
