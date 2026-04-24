@@ -12,8 +12,9 @@ const PRESALE_NOTE_TEXT = process.env.PRESALE_NOTE_TEXT || 'Агент вийш�
 const INTERCOM_VERSION = '2.14';
 
 const lastProcessedDate = new Map();
+const processedWebhookIds = new Set(); // Захист від дублікатів вебхуків
 let consecutiveFailures = 0;
-const MAX_FAILURES = 3;
+const MAX_FAILURES = 5;
 
 // === HELPER: LOGGING ===
 function log(tag, message) {
@@ -21,15 +22,22 @@ function log(tag, message) {
   console.log(`[${ts}] [${tag}] ${message}`);
 }
 
-// === HELPER: API WITH CIRCUIT BREAKER & VERBOSE LOGS ===
+// Скидання запобіжника кожні 10 хвилин про всяк випадок
+setInterval(() => {
+  if (consecutiveFailures > 0) {
+    log('SYSTEM', 'Автоматичне скидання лічильника помилок.');
+    consecutiveFailures = 0;
+  }
+}, 600000);
+
+// === HELPER: API WITH RATE LIMIT HANDLING ===
 async function intercomApi(method, endpoint, data = null, timeout = 20000) {
   if (consecutiveFailures >= MAX_FAILURES) {
-    log('CIRCUIT-BREAKER', `ПЕРЕРИВНИК АКТИВНИЙ: Пропускаємо ${method} ${endpoint}`);
+    log('CIRCUIT-BREAKER', `БЛОКУВАННЯ: ${method} ${endpoint} скасовано.`);
     return null;
   }
 
   try {
-    log('API-CALL', `Запит: ${method.toUpperCase()} ${endpoint}`);
     const res = await axios({
       method,
       url: `https://api.intercom.io${endpoint}`,
@@ -45,85 +53,67 @@ async function intercomApi(method, endpoint, data = null, timeout = 20000) {
     consecutiveFailures = 0;
     return res.data;
   } catch (error) {
-    consecutiveFailures++;
+    if (error.response?.status === 429) {
+      log('RATE-LIMIT', 'Отримано 429. Чекаємо 5 секунд...');
+      await new Promise(r => setTimeout(r, 5000));
+      consecutiveFailures++;
+    } else {
+      consecutiveFailures++;
+    }
     const details = error.response?.data ? JSON.stringify(error.response.data) : error.message;
-    log('API-ERROR', `Помилка ${endpoint}: ${details}`);
+    log('API-ERROR', `${endpoint} (${error.response?.status || 'TIMEOUT'}): ${details}`);
     throw error;
   }
 }
 
 // === LOGIC 1 & 2: UNPAID & SUBSCRIPTION ===
 async function handleValidation(contactId, convId) {
-  log('VAL-START', `Початок перевірки чату ${convId} (контакт: ${contactId})`);
   try {
     const conv = await intercomApi('get', `/conversations/${convId}`);
-    if (!conv) return;
-
-    const assignee = conv.assignee;
-    log('VAL-INFO', `Призначено на: ${assignee?.type} (ID: ${assignee?.id})`);
-    
-    if (assignee?.type === 'bot' || assignee?.id?.startsWith('bot_')) {
-      log('VAL-SKIP', `Чат ${convId} у бота. Пропускаємо валідацію.`);
-      return;
-    }
+    if (!conv || conv.assignee?.type === 'bot') return;
 
     const contact = await intercomApi('get', `/contacts/${contactId}`);
-    if (!contact) {
-      log('VAL-ERROR', `Не вдалося отримати дані контакту ${contactId}`);
-      return;
-    }
+    if (!contact) return;
 
-    // 1. Unpaid Logic
+    // 1. Unpaid Logic (Case-insensitive check)
     const email = contact.email;
-    const purchaseEmail = contact.custom_attributes?.['Purchase email'];
-    log('VAL-INFO', `Email: ${email} | Purchase Email: ${purchaseEmail}`);
-
-    if (email || purchaseEmail) {
-      log('VAL-FETCH-LIST', `Завантажуємо список із ${LIST_URL}`);
+    const pEmail = contact.custom_attributes?.['Purchase Email'] || contact.custom_attributes?.['Purchase email'];
+    
+    if (email || pEmail) {
       const { data: list } = await axios.get(LIST_URL, { timeout: 8000 });
+      const check = (e) => e && list.some(le => le?.trim().toLowerCase() === e.trim().toLowerCase());
       
-      const checkEmail = (e) => e && list.some(le => le?.trim().toLowerCase() === e.trim().toLowerCase());
-      const isMatch = checkEmail(email) || checkEmail(purchaseEmail);
-
-      if (isMatch) {
-        log('VAL-ACTION', `Знайдено співпадіння в списку для ${contactId}. Оновлюємо Unpaid Custom.`);
-        await intercomApi('put', `/contacts/${contactId}`, { custom_attributes: { 'Unpaid Custom': true } });
-      } else {
-        log('VAL-INFO', `Співпадінь у списку Unpaid немає.`);
+      if (check(email) || check(pEmail)) {
+        if (contact.custom_attributes?.['Unpaid Custom'] !== true) {
+          await intercomApi('put', `/contacts/${contactId}`, { custom_attributes: { 'Unpaid Custom': true } });
+          log('ACTION', `Unpaid set for ${contactId}`);
+        }
       }
     }
 
     // 2. Subscription Logic
-    const subValue = contact.custom_attributes?.['subscription'];
-    log('VAL-INFO', `Поточне значення subscription: "${subValue || 'порожньо'}"`);
-    
-    if (!subValue || subValue.trim() === '') {
-      log('VAL-ACTION', `Subscription порожній. Додаємо нотатку в чат ${convId}`);
+    const sub = contact.custom_attributes?.['subscription'] || contact.custom_attributes?.['Subscription'];
+    if (!sub || sub.trim() === '') {
       await intercomApi('post', `/conversations/${convId}/reply`, {
-        message_type: 'note',
-        admin_id: ADMIN_ID,
-        body: 'Заповніть будь ласка subscription 😇🙏'
+        message_type: 'note', admin_id: ADMIN_ID, body: 'Заповніть будь ласка subscription 😇🙏'
       });
+      log('ACTION', `Sub note added to ${convId}`);
     }
   } catch (e) {
-    log('VAL-FATAL', `Помилка в handleValidation: ${e.message}`);
+    log('VAL-FAIL', e.message);
   }
 }
 
 // === LOGIC 3: PRESALE ===
 async function handlePresale(adminId) {
   const today = new Date().toISOString().split('T')[0];
-  log('PRESALE-TRIGGER', `Перевірка для адміна ${adminId}. Дата: ${today}`);
-
   if (lastProcessedDate.get(adminId) === today) {
-    log('PRESALE-SKIP', `Адмін ${adminId} вже оброблявся сьогодні. Зупиняємо.`);
+    log('PRESALE-SKIP', `Адмін ${adminId} вже оброблявся сьогодні.`);
     return;
   }
 
   try {
     const todayMidnightUnix = Math.floor(new Date().setHours(0, 0, 0, 0) / 1000);
-    log('PRESALE-SEARCH', `Шукаємо snoozed чати команди ${PRESALE_TEAM_ID}. Межа часу (північ): ${todayMidnightUnix}`);
-
     const search = await intercomApi('post', '/conversations/search', {
       query: {
         operator: 'AND',
@@ -132,33 +122,25 @@ async function handlePresale(adminId) {
           { field: 'team_assignee_id', operator: '=', value: PRESALE_TEAM_ID }
         ]
       },
-      pagination: { per_page: 30 }
-    }, 25000);
+      pagination: { per_page: 20 }
+    });
 
     const conversations = search?.conversations || [];
-    log('PRESALE-INFO', `Знайдено всього snoozed чатів: ${conversations.length}`);
+    log('PRESALE-INFO', `Знайдено чатів: ${conversations.length}`);
 
-    let processedCount = 0;
+    // Фільтруємо старі чати
+    const toProcess = conversations.filter(c => {
+      const isOld = c.updated_at < todayMidnightUnix;
+      const noFollowUp = c.custom_attributes?.['Follow-Up'] !== true;
+      return isOld && noFollowUp;
+    }).slice(0, 15);
 
-    for (const conv of conversations) {
-      log('PRESALE-CHECK', `Аналіз чату ${conv.id}: updated_at=${conv.updated_at}`);
+    log('PRESALE-INFO', `Буде оброблено: ${toProcess.length}`);
 
-      const isOld = conv.updated_at < todayMidnightUnix;
-      const isFollowUp = conv.custom_attributes?.['Follow-Up'] === true;
-
-      if (!isOld) {
-        log('PRESALE-SKIP-ITEM', `Чат ${conv.id} оновлювався сьогодні (${conv.updated_at}). Пропускаємо.`);
-        continue;
-      }
-
-      if (isFollowUp) {
-        log('PRESALE-SKIP-ITEM', `Чат ${conv.id} має Follow-Up: true. Пропускаємо.`);
-        continue;
-      }
-
-      log('PRESALE-ACTION', `Чат ${conv.id} підходить! Пробуджуємо та ставимо нотатку.`);
+    for (const conv of toProcess) {
+      log('ACTION', `Обробка чату ${conv.id}`);
       
-      // Крок 1: Пробудження
+      // Snooze (пробудження)
       await intercomApi('post', `/conversations/${conv.id}/reply`, {
         message_type: 'snoozed',
         admin_id: adminId,
@@ -167,69 +149,58 @@ async function handlePresale(adminId) {
 
       await new Promise(r => setTimeout(r, 1500));
 
-      // Крок 2: Нотатка
+      // Note
       await intercomApi('post', `/conversations/${conv.id}/reply`, {
         message_type: 'note',
         admin_id: adminId,
         body: PRESALE_NOTE_TEXT
       });
 
-      processedCount++;
-      if (processedCount >= 15) {
-        log('PRESALE-LIMIT', `Досягнуто ліміту 15 чатів за один прохід для безпеки.`);
-        break;
-      }
+      await new Promise(r => setTimeout(r, 500));
     }
 
     lastProcessedDate.set(adminId, today);
-    log('PRESALE-SUCCESS', `Обробку завершено. Оброблено чатів: ${processedCount}`);
   } catch (e) {
-    log('PRESALE-FATAL', `Помилка в handlePresale: ${e.message}`);
+    log('PRESALE-FAIL', e.message);
   }
 }
 
 // === WEBHOOK HANDLER ===
 app.post('/validate-email', (req, res) => {
-  const { topic, data } = req.body;
-  const itemId = data?.item?.id;
-
-  log('WEBHOOK-RCV', `Отримано: ${topic} | ID: ${itemId}`);
+  const webhookId = req.headers['x-intercom-webhook-id'] || JSON.stringify(req.body).length;
   
-  // Миттєва відповідь
+  // Захист від повторів (Intercom може слати один і той самий вебхук кілька разів)
+  if (processedWebhookIds.has(webhookId)) {
+    return res.sendStatus(200);
+  }
+  processedWebhookIds.add(webhookId);
+  setTimeout(() => processedWebhookIds.delete(webhookId), 30000);
+
   res.sendStatus(200);
+
+  const { topic, data } = req.body;
+  if (!data?.item) return;
 
   setImmediate(async () => {
     try {
-      if (!data?.item) {
-        log('WEBHOOK-VOID', 'Порожні дані в item. Пропускаємо.');
-        return;
-      }
-
       const item = data.item;
+      log('FLOW', `Topic: ${topic} | ID: ${item.id}`);
 
-      // Присейл: повернення з авею
       if (topic === 'admin.away_mode_updated' && item.away_mode_enabled === false) {
-        log('FLOW', `Адмін ${item.id} повернувся в онлайн. Запускаємо присейл-логіку.`);
         await handlePresale(item.id);
       }
 
-      // Валідація: нові повідомлення або призначення
       if (topic.includes('conversation.user') || topic === 'conversation.admin.assigned') {
-        const contactId = item.contacts?.contacts?.[0]?.id || item.source?.author?.id || item.author?.id;
-        log('FLOW', `Подія чату. Чат: ${item.id}, Контакт: ${contactId || 'не знайдено'}`);
-        if (contactId) {
-          await handleValidation(contactId, item.id);
-        } else {
-          log('FLOW-WARN', `Не вдалося визначити contactId для чату ${item.id}`);
-        }
+        const contactId = item.contacts?.contacts?.[0]?.id || item.author?.id || item.source?.author?.id;
+        if (contactId) await handleValidation(contactId, item.id);
       }
     } catch (err) {
-      log('ASYNC-ERROR-CORE', `Критичний збій обробки: ${err.message}`);
+      log('ASYNC-ERR', err.message);
     }
   });
 });
 
-app.get('/', (req, res) => res.send('LOGS ACTIVE'));
+app.get('/', (req, res) => res.send('OK'));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => log('SYSTEM', `Сервер з розширеними логами на порту ${PORT}`));
+app.listen(PORT, () => log('SYSTEM', `Server listening on ${PORT}`));
