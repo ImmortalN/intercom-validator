@@ -13,6 +13,8 @@ const PRESALE_NOTE_TEXT = process.env.PRESALE_NOTE_TEXT || 'Агент вийш�
 const INTERCOM_VERSION = '2.14';
 
 const lastProcessedDate = new Map();
+let activeRequests = 0;
+const MAX_CONCURRENT_REQUESTS = 3; // Обмеження одночасних запитів
 
 // === HELPER: LOGGING ===
 function log(tag, message) {
@@ -20,8 +22,14 @@ function log(tag, message) {
   console.log(`[${timestamp}] [${tag}] ${message}`);
 }
 
-// === HELPER: API REQUEST WITH RETRY ===
-async function intercomRequest(method, endpoint, data = null, customTimeout = 15000) {
+// === HELPER: API REQUEST WITH RETRY & CONCURRENCY CONTROL ===
+async function intercomRequest(method, endpoint, data = null, customTimeout = 30000) {
+  // Простий механізм очікування черги
+  while (activeRequests >= MAX_CONCURRENT_REQUESTS) {
+    await new Promise(resolve => setTimeout(resolve, 500));
+  }
+  
+  activeRequests++;
   try {
     const config = {
       method,
@@ -41,22 +49,21 @@ async function intercomRequest(method, endpoint, data = null, customTimeout = 15
     const errorData = error.response?.data ? JSON.stringify(error.response.data) : error.message;
     log('API-ERROR', `${method.toUpperCase()} ${endpoint} -> ${errorData}`);
     throw error;
+  } finally {
+    activeRequests--;
   }
 }
 
-async function intercomRequestWithRetry(method, endpoint, data = null, retries = 2, customTimeout = 20000) {
+async function intercomRequestWithRetry(method, endpoint, data = null, retries = 2, customTimeout = 30000) {
   for (let i = 0; i <= retries; i++) {
     try {
-      await new Promise(resolve => setTimeout(resolve, 300)); // Rate limit protection
       return await intercomRequest(method, endpoint, data, customTimeout);
     } catch (error) {
-      const isRateLimit = error.response?.status === 429;
       const isTimeout = error.code === 'ECONNABORTED' || error.message.includes('timeout');
+      if (i === retries || !isTimeout) throw error;
       
-      if (i === retries || (!isRateLimit && !isTimeout)) throw error;
-      
-      const delay = isRateLimit ? 5000 : 2000 * Math.pow(2, i);
-      log('RETRY', `Issue on ${endpoint}. Retrying in ${delay}ms... (Attempt ${i + 1})`);
+      const delay = 2000 * Math.pow(2, i);
+      log('RETRY', `Attempt ${i + 1} for ${endpoint}. Waiting ${delay}ms...`);
       await new Promise(resolve => setTimeout(resolve, delay));
     }
   }
@@ -64,34 +71,46 @@ async function intercomRequestWithRetry(method, endpoint, data = null, retries =
 
 // === LOGIC 1 & 2: UNPAID & SUBSCRIPTION ===
 async function validateContactData(contactId, conversationId) {
+  log('START', `Processing chat ${conversationId}`);
   try {
     const conversation = await intercomRequestWithRetry('get', `/conversations/${conversationId}`);
-    if (conversation.assignee?.type === 'bot') return;
+    
+    // Перевірка на бота
+    const assignee = conversation.assignee;
+    if (assignee?.type === 'bot' || assignee?.id?.startsWith('bot_')) {
+      log('SKIP', `Chat ${conversationId} is currently with a bot.`);
+      return;
+    }
 
     const contact = await intercomRequestWithRetry('get', `/contacts/${contactId}`);
     
-    // Unpaid
+    // Unpaid Logic
     const email = contact.email;
     const pEmail = contact.custom_attributes?.['Purchase Email'];
     if (email || pEmail) {
-      const list = (await axios.get(LIST_URL)).data;
+      const listRes = await axios.get(LIST_URL);
+      const list = listRes.data;
       if (list.includes(email) || list.includes(pEmail)) {
         await intercomRequestWithRetry('put', `/contacts/${contactId}`, {
           custom_attributes: { 'Unpaid Custom': true }
         });
-        log('ACTION', `Updated Unpaid status for ${contactId}`);
+        log('ACTION', `Unpaid attribute set for ${contactId}`);
       }
     }
 
-    // Subscription
-    if (!contact.custom_attributes?.['subscription']?.trim()) {
+    // Subscription Logic
+    const sub = contact.custom_attributes?.['subscription'];
+    if (!sub || sub.trim() === '') {
       await intercomRequestWithRetry('post', `/conversations/${conversationId}/reply`, {
-        message_type: 'note', admin_id: ADMIN_ID, body: 'Заповніть будь ласка subscription 😇🙏'
+        message_type: 'note',
+        admin_id: ADMIN_ID,
+        body: 'Заповніть будь ласка subscription 😇🙏'
       });
-      log('ACTION', `Sent sub note to ${conversationId}`);
+      log('ACTION', `Subscription note added to ${conversationId}`);
     }
+
   } catch (err) {
-    log('ERROR-VAL', err.message);
+    log('ERROR-VAL', `Validation failed for ${conversationId}: ${err.message}`);
   }
 }
 
@@ -100,39 +119,38 @@ async function checkPresaleSnoozedChats(adminId) {
   const today = new Date().toISOString().split('T')[0];
   if (lastProcessedDate.get(adminId) === today) return;
 
-  log('PRESALE-START', `Processing for admin ${adminId}`);
+  log('PRESALE-START', `Triggered by admin ${adminId}`);
 
   try {
     const startOfTodayUnix = Math.floor(new Date().setHours(0, 0, 0, 0) / 1000);
     
-    // Пошук з пагінацією та великим таймаутом
     const searchResult = await intercomRequestWithRetry('post', '/conversations/search', {
       query: { field: 'state', operator: '=', value: 'snoozed' },
       pagination: { per_page: 50 }
-    }, 2, 40000);
+    }, 2, 50000); // Дуже великий таймаут для пошуку
 
     const conversations = searchResult.conversations || [];
-    log('PRESALE-INFO', `Found ${conversations.length} snoozed chats.`);
+    log('PRESALE-INFO', `Snoozed chats found: ${conversations.length}`);
 
     for (const conv of conversations) {
-      // ПЕРЕВІРКА: чи чат належить команді і чи він "старий"
+      // Фільтрація: команда + час + атрибут
       if (conv.team_assignee_id === PRESALE_TEAM_ID && conv.updated_at < startOfTodayUnix) {
         
         if (conv.custom_attributes?.['Follow-Up'] === true) {
-          log('PRESALE-SKIP', `Chat ${conv.id} has Follow-Up active.`);
+          log('PRESALE-SKIP', `Chat ${conv.id} has Follow-Up blocked.`);
           continue;
         }
 
-        log('ACTION', `Waking up & noting chat ${conv.id}`);
+        log('ACTION', `Waking up chat ${conv.id}`);
 
-        // КРОК 1: Пробудження (Параметр snooze_until - БЕЗ 'd')
+        // КРОК 1: Пробудження (Використовуємо snoozed_until)
         await intercomRequestWithRetry('post', `/conversations/${conv.id}/reply`, {
           message_type: 'snoozed',
           admin_id: adminId,
-          snooze_until: Math.floor(Date.now() / 1000) + 60
+          snoozed_until: Math.floor(Date.now() / 1000) + 60
         });
 
-        await new Promise(resolve => setTimeout(resolve, 1000)); // Більша пауза для стабільності
+        await new Promise(resolve => setTimeout(resolve, 1200));
 
         // КРОК 2: Нотатка
         await intercomRequestWithRetry('post', `/conversations/${conv.id}/reply`, {
@@ -141,24 +159,24 @@ async function checkPresaleSnoozedChats(adminId) {
           body: PRESALE_NOTE_TEXT
         });
 
-        await new Promise(resolve => setTimeout(resolve, 500)); 
+        await new Promise(resolve => setTimeout(resolve, 500));
       }
     }
 
     lastProcessedDate.set(adminId, today);
-    log('SUCCESS', `Presale check finished.`);
+    log('SUCCESS', `Presale check completed for ${adminId}`);
   } catch (err) {
-    log('ERROR-PRESALE', `Check failed: ${err.message}`);
+    log('ERROR-PRESALE', `Presale logic failed: ${err.message}`);
   }
 }
 
 // === ROUTES ===
 
-app.get('/', (req, res) => res.send('Server is Up'));
+app.get('/', (req, res) => res.send('Server Running'));
 app.get('/favicon.ico', (req, res) => res.status(204).end());
 
 app.post('/validate-email', (req, res) => {
-  res.sendStatus(200); // Відповідаємо відразу
+  res.sendStatus(200);
 
   const { topic, data } = req.body;
   if (!data?.item) return;
@@ -166,12 +184,11 @@ app.post('/validate-email', (req, res) => {
   const item = data.item;
   log('WEBHOOK-RCV', `Topic: ${topic}, ID: ${item.id}`);
 
-  // Асинхронний запуск
   (async () => {
     try {
       if (topic === 'conversation.user.created' || topic === 'conversation.user.replied') {
-        const cId = item.contacts?.contacts?.[0]?.id || item.source?.author?.id;
-        if (cId) await validateContactData(cId, item.id);
+        const contactId = item.contacts?.contacts?.[0]?.id || item.source?.author?.id;
+        if (contactId) await validateContactData(contactId, item.id);
       }
 
       if (topic === 'admin.away_mode_updated' && item.away_mode_enabled === false) {
@@ -184,4 +201,4 @@ app.post('/validate-email', (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => log('SYSTEM', `Server started on ${PORT}`));
+app.listen(PORT, () => log('SYSTEM', `Server listening on ${PORT}`));
