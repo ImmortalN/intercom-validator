@@ -13,8 +13,7 @@ const INTERCOM_VERSION = '2.14';
 
 const lastProcessedDate = new Map();
 const processedWebhookIds = new Set();
-let consecutiveFailures = 0;
-const MAX_FAILURES = 5;
+let isPresaleRunning = false; // Блокувальник паралельного присейлу
 
 // === HELPER: LOGGING ===
 function log(tag, message) {
@@ -22,61 +21,51 @@ function log(tag, message) {
   console.log(`[${ts}] [${tag}] ${message}`);
 }
 
-// === HELPER: API WITH RETRY & LOGS ===
-async function intercomApi(method, endpoint, data = null, timeout = 15000) {
-  if (consecutiveFailures >= MAX_FAILURES) {
-    log('CIRCUIT-BREAKER', `ОТМЕНА: ${method} ${endpoint}`);
-    return null;
-  }
-
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    try {
-      const res = await axios({
-        method,
-        url: `https://api.intercom.io${endpoint}`,
-        headers: {
-          'Authorization': `Bearer ${INTERCOM_TOKEN}`,
-          'Content-Type': 'application/json',
-          'Accept': 'application/json',
-          'Intercom-Version': INTERCOM_VERSION
-        },
-        data,
-        timeout
-      });
-      consecutiveFailures = 0;
-      return res.data;
-    } catch (error) {
-      if (error.code === 'ECONNABORTED' && attempt < 2) {
-        log('RETRY', `Timeout на ${endpoint}, попытка №${attempt + 1}...`);
-        await new Promise(r => setTimeout(r, 1000));
-        continue;
-      }
-      consecutiveFailures++;
-      log('API-ERROR', `${endpoint}: ${error.message}`);
-      throw error;
-    }
+// === HELPER: API WITH FAST TIMEOUT & RETRY ===
+async function intercomApi(method, endpoint, data = null, timeout = 10000) {
+  try {
+    const res = await axios({
+      method,
+      url: `https://api.intercom.io${endpoint}`,
+      headers: {
+        'Authorization': `Bearer ${INTERCOM_TOKEN}`,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'Intercom-Version': INTERCOM_VERSION
+      },
+      data,
+      timeout
+    });
+    return res.data;
+  } catch (error) {
+    const status = error.response?.status;
+    const msg = error.code === 'ECONNABORTED' ? 'TIMEOUT' : error.message;
+    log('API-ERROR', `${method.toUpperCase()} ${endpoint} (${status || msg})`);
+    throw error;
   }
 }
 
 // === LOGIC 1 & 2: UNPAID & SUBSCRIPTION ===
 async function handleValidation(contactId, convId) {
   try {
-    const conv = await intercomApi('get', `/conversations/${convId}`);
-    if (!conv || conv.assignee?.type === 'bot') return;
+    // Отримуємо чат і контакт ПАРАЛЕЛЬНО, щоб зекономити час
+    const [conv, contact] = await Promise.all([
+      intercomApi('get', `/conversations/${convId}`),
+      intercomApi('get', `/contacts/${contactId}`)
+    ]);
 
-    const contact = await intercomApi('get', `/contacts/${contactId}`);
-    if (!contact) return;
+    if (!conv || !contact || conv.assignee?.type === 'bot') return;
 
     // Unpaid Logic
     const email = contact.email;
     const pEmail = contact.custom_attributes?.['Purchase Email'] || contact.custom_attributes?.['Purchase email'];
     if (email || pEmail) {
-      const { data: list } = await axios.get(LIST_URL, { timeout: 8000 });
+      const { data: list } = await axios.get(LIST_URL, { timeout: 5000 });
       const check = (e) => e && list.some(le => le?.trim().toLowerCase() === e.trim().toLowerCase());
       if (check(email) || check(pEmail)) {
         if (contact.custom_attributes?.['Unpaid Custom'] !== true) {
           await intercomApi('put', `/contacts/${contactId}`, { custom_attributes: { 'Unpaid Custom': true } });
-          log('ACTION', `Unpaid установлен для ${contactId}`);
+          log('ACTION', `Unpaid set for ${contactId}`);
         }
       }
     }
@@ -87,7 +76,7 @@ async function handleValidation(contactId, convId) {
       await intercomApi('post', `/conversations/${convId}/reply`, {
         message_type: 'note', admin_id: ADMIN_ID, body: 'Заповніть будь ласка subscription 😇🙏'
       });
-      log('ACTION', `Subscription note добавлена в ${convId}`);
+      log('ACTION', `Sub note added to ${convId}`);
     }
   } catch (e) {
     log('VAL-FAIL', `${convId}: ${e.message}`);
@@ -96,14 +85,18 @@ async function handleValidation(contactId, convId) {
 
 // === LOGIC 3: PRESALE ===
 async function handlePresale(adminId) {
-  const today = new Date().toISOString().split('T')[0];
-  if (lastProcessedDate.get(adminId) === today) {
-    log('PRESALE-SKIP', `Админ ${adminId} уже был сегодня.`);
+  if (isPresaleRunning) {
+    log('PRESALE-SKIP', 'Присейл вже виконується, пропускаємо дублікат.');
     return;
   }
 
+  const today = new Date().toISOString().split('T')[0];
+  if (lastProcessedDate.get(adminId) === today) return;
+
+  isPresaleRunning = true;
   try {
     const todayMidnightUnix = Math.floor(new Date().setHours(0, 0, 0, 0) / 1000);
+    
     const search = await intercomApi('post', '/conversations/search', {
       query: {
         operator: 'AND',
@@ -118,17 +111,15 @@ async function handlePresale(adminId) {
     const toProcess = conversations.filter(c => {
       const lastAdmin = c.statistics?.last_admin_reply_at || 0;
       const lastContact = c.statistics?.last_contact_reply_at || 0;
-      const isOld = lastAdmin < todayMidnightUnix && lastContact < todayMidnightUnix;
-      const noFollowUp = c.custom_attributes?.['Follow-Up'] !== true;
-      return isOld && noFollowUp;
-    }).slice(0, 10); // Ограничиваем пачку до 10
+      return lastAdmin < todayMidnightUnix && lastContact < todayMidnightUnix && c.custom_attributes?.['Follow-Up'] !== true;
+    }).slice(0, 8); // Зменшив до 8 для стабільності
 
-    log('PRESALE-INFO', `Найдено: ${conversations.length}, к обработке: ${toProcess.length}`);
+    log('PRESALE-INFO', `До обробки: ${toProcess.length}`);
 
     for (const conv of toProcess) {
-      log('ACTION', `Пробуждение + Нотатка для ${conv.id}`);
-
-      // Запускаем оба действия параллельно, чтобы сэкономить время и избежать таймаутов
+      log('ACTION', `Snooze + Note для ${conv.id}`);
+      
+      // Відправляємо одночасно
       await Promise.allSettled([
         intercomApi('post', `/conversations/${conv.id}/reply`, {
           message_type: 'snoozed',
@@ -142,13 +133,14 @@ async function handlePresale(adminId) {
         })
       ]);
       
-      log('PRESALE-DONE', `Чат ${conv.id} обработан.`);
-      await new Promise(r => setTimeout(r, 800)); // Небольшая пауза между чатами
+      await new Promise(r => setTimeout(r, 1000)); // Пауза між чатами
     }
 
     lastProcessedDate.set(adminId, today);
   } catch (e) {
     log('PRESALE-FAIL', e.message);
+  } finally {
+    isPresaleRunning = false;
   }
 }
 
@@ -159,6 +151,7 @@ app.post('/validate-email', (req, res) => {
   processedWebhookIds.add(webhookId);
   setTimeout(() => processedWebhookIds.delete(webhookId), 60000);
 
+  // Відповідаємо негайно
   res.sendStatus(200);
 
   const { topic, data } = req.body;
@@ -183,7 +176,7 @@ app.post('/validate-email', (req, res) => {
   });
 });
 
-app.get('/', (req, res) => res.send('Active'));
+app.get('/', (req, res) => res.send('Worker Active'));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => log('SYSTEM', `Server started on ${PORT}`));
