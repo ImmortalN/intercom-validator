@@ -5,24 +5,21 @@ app.use(express.json());
 
 // === CONFIGURATION ===
 const INTERCOM_TOKEN = process.env.INTERCOM_TOKEN;
-const LIST_URL = process.env.LIST_URL;
 const ADMIN_ID = process.env.ADMIN_ID;
 const PRESALE_TEAM_ID = process.env.PRESALE_TEAM_ID;
 const PRESALE_NOTE_TEXT = process.env.PRESALE_NOTE_TEXT || 'Агент вийшов в онлайн — перевіряємо заснужені чати presale 🚀';
 const INTERCOM_VERSION = '2.14';
 
 const lastProcessedDate = new Map();
-const processedWebhookIds = new Set();
-let isPresaleRunning = false; // Блокувальник паралельного присейлу
+let isPresaleRunning = false; 
 
-// === HELPER: LOGGING ===
 function log(tag, message) {
   const ts = new Date().toISOString().replace('T', ' ').split('.')[0];
   console.log(`[${ts}] [${tag}] ${message}`);
 }
 
-// === HELPER: API WITH FAST TIMEOUT & RETRY ===
-async function intercomApi(method, endpoint, data = null, timeout = 10000) {
+// Полегшений API клієнт (таймаут 8с)
+async function intercomApi(method, endpoint, data = null) {
   try {
     const res = await axios({
       method,
@@ -34,69 +31,31 @@ async function intercomApi(method, endpoint, data = null, timeout = 10000) {
         'Intercom-Version': INTERCOM_VERSION
       },
       data,
-      timeout
+      timeout: 8000
     });
     return res.data;
   } catch (error) {
-    const status = error.response?.status;
-    const msg = error.code === 'ECONNABORTED' ? 'TIMEOUT' : error.message;
-    log('API-ERROR', `${method.toUpperCase()} ${endpoint} (${status || msg})`);
+    log('API-ERROR', `${method.toUpperCase()} ${endpoint}: ${error.message}`);
     throw error;
   }
 }
 
-// === LOGIC 1 & 2: UNPAID & SUBSCRIPTION ===
-async function handleValidation(contactId, convId) {
-  try {
-    // Отримуємо чат і контакт ПАРАЛЕЛЬНО, щоб зекономити час
-    const [conv, contact] = await Promise.all([
-      intercomApi('get', `/conversations/${convId}`),
-      intercomApi('get', `/contacts/${contactId}`)
-    ]);
-
-    if (!conv || !contact || conv.assignee?.type === 'bot') return;
-
-    // Unpaid Logic
-    const email = contact.email;
-    const pEmail = contact.custom_attributes?.['Purchase Email'] || contact.custom_attributes?.['Purchase email'];
-    if (email || pEmail) {
-      const { data: list } = await axios.get(LIST_URL, { timeout: 5000 });
-      const check = (e) => e && list.some(le => le?.trim().toLowerCase() === e.trim().toLowerCase());
-      if (check(email) || check(pEmail)) {
-        if (contact.custom_attributes?.['Unpaid Custom'] !== true) {
-          await intercomApi('put', `/contacts/${contactId}`, { custom_attributes: { 'Unpaid Custom': true } });
-          log('ACTION', `Unpaid set for ${contactId}`);
-        }
-      }
-    }
-
-    // Subscription Logic
-    const sub = contact.custom_attributes?.['subscription'] || contact.custom_attributes?.['Subscription'];
-    if (!sub || sub.trim() === '') {
-      await intercomApi('post', `/conversations/${convId}/reply`, {
-        message_type: 'note', admin_id: ADMIN_ID, body: 'Заповніть будь ласка subscription 😇🙏'
-      });
-      log('ACTION', `Sub note added to ${convId}`);
-    }
-  } catch (e) {
-    log('VAL-FAIL', `${convId}: ${e.message}`);
-  }
-}
-
-// === LOGIC 3: PRESALE ===
 async function handlePresale(adminId) {
-  if (isPresaleRunning) {
-    log('PRESALE-SKIP', 'Присейл вже виконується, пропускаємо дублікат.');
+  if (isPresaleRunning) return;
+
+  const today = new Date().toISOString().split('T')[0];
+  if (lastProcessedDate.get(adminId) === today) {
+    log('SKIP', `Адмін ${adminId} вже перевірявся сьогодні.`);
     return;
   }
 
-  const today = new Date().toISOString().split('T')[0];
-  if (lastProcessedDate.get(adminId) === today) return;
-
   isPresaleRunning = true;
+  log('START', `Запуск присейл-черги для адміна ${adminId}`);
+
   try {
     const todayMidnightUnix = Math.floor(new Date().setHours(0, 0, 0, 0) / 1000);
     
+    // Шукаємо тільки 10 чатів за раз, щоб не "повісити" API
     const search = await intercomApi('post', '/conversations/search', {
       query: {
         operator: 'AND',
@@ -104,22 +63,24 @@ async function handlePresale(adminId) {
           { field: 'state', operator: '=', value: 'snoozed' },
           { field: 'team_assignee_id', operator: '=', value: PRESALE_TEAM_ID }
         ]
-      }
+      },
+      pagination: { per_page: 10 }
     });
 
     const conversations = search?.conversations || [];
     const toProcess = conversations.filter(c => {
       const lastAdmin = c.statistics?.last_admin_reply_at || 0;
       const lastContact = c.statistics?.last_contact_reply_at || 0;
+      // Тільки старі чати (до сьогоднішньої півночі) і без Follow-Up
       return lastAdmin < todayMidnightUnix && lastContact < todayMidnightUnix && c.custom_attributes?.['Follow-Up'] !== true;
-    }).slice(0, 8); // Зменшив до 8 для стабільності
+    });
 
-    log('PRESALE-INFO', `До обробки: ${toProcess.length}`);
+    log('INFO', `Знайдено чатів: ${conversations.length}, підходять під критерії: ${toProcess.length}`);
 
     for (const conv of toProcess) {
-      log('ACTION', `Snooze + Note для ${conv.id}`);
+      log('ACTION', `Обробка чату ${conv.id}`);
       
-      // Відправляємо одночасно
+      // Використовуємо Promise.allSettled для швидкості всередині одного чату
       await Promise.allSettled([
         intercomApi('post', `/conversations/${conv.id}/reply`, {
           message_type: 'snoozed',
@@ -133,50 +94,30 @@ async function handlePresale(adminId) {
         })
       ]);
       
-      await new Promise(r => setTimeout(r, 1000)); // Пауза між чатами
+      // Велика пауза між різними чатами, щоб Intercom "відпочив"
+      await new Promise(r => setTimeout(r, 2000));
     }
 
     lastProcessedDate.set(adminId, today);
+    log('FINISH', `Присейл успішно завершено для адміна ${adminId}`);
   } catch (e) {
-    log('PRESALE-FAIL', e.message);
+    log('FAIL', `Помилка присейлу: ${e.message}`);
   } finally {
     isPresaleRunning = false;
   }
 }
 
-// === WEBHOOK HANDLER ===
+// Вебхук обробляє ТІЛЬКИ одну подію
 app.post('/validate-email', (req, res) => {
-  const webhookId = req.headers['x-intercom-webhook-id'] || Math.random();
-  if (processedWebhookIds.has(webhookId)) return res.sendStatus(200);
-  processedWebhookIds.add(webhookId);
-  setTimeout(() => processedWebhookIds.delete(webhookId), 60000);
-
-  // Відповідаємо негайно
-  res.sendStatus(200);
+  res.sendStatus(200); // Відповідаємо відразу
 
   const { topic, data } = req.body;
-  if (!data?.item) return;
-
-  setImmediate(async () => {
-    try {
-      const item = data.item;
-      log('FLOW', `Topic: ${topic} | ID: ${item.id}`);
-
-      if (topic === 'admin.away_mode_updated' && item.away_mode_enabled === false) {
-        await handlePresale(item.id);
-      }
-
-      if (topic.includes('conversation.user') || topic === 'conversation.admin.assigned') {
-        const contactId = item.contacts?.contacts?.[0]?.id || item.author?.id || item.source?.author?.id;
-        if (contactId) await handleValidation(contactId, item.id);
-      }
-    } catch (err) {
-      log('ASYNC-ERR', err.message);
-    }
-  });
+  if (topic === 'admin.away_mode_updated' && data?.item?.away_mode_enabled === false) {
+    handlePresale(data.item.id).catch(err => log('ASYNC-ERR', err.message));
+  }
 });
 
-app.get('/', (req, res) => res.send('Worker Active'));
+app.get('/', (req, res) => res.send('Presale Worker Only Active'));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => log('SYSTEM', `Server started on ${PORT}`));
