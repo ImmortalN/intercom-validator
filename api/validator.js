@@ -4,194 +4,286 @@ const app = express();
 
 app.use(express.json());
 
-// === КОНФІГУРАЦІЯ ===
+// === ГЛОБАЛЬНЫЙ ЛОГ ===
+app.use((req, res, next) => {
+    console.log(`[GLOBAL] ${new Date().toISOString()} | ${req.method} ${req.url}`);
+    next();
+});
+
+// === CONFIG ===
 const INTERCOM_TOKEN = process.env.INTERCOM_TOKEN;
 const LIST_URL = process.env.LIST_URL;
-const ADMIN_ID = process.env.ADMIN_ID; // ID для системних нотаток (Subscription)
+const ADMIN_ID = process.env.ADMIN_ID;
 const PRESALE_TEAM_ID = process.env.PRESALE_TEAM_ID;
-const PRESALE_NOTE_TEXT = process.env.PRESALE_NOTE_TEXT || 'Агент вийшов в онлайн — перевіряємо чати пресейлу 😎';
+const PRESALE_NOTE_TEXT = process.env.PRESALE_NOTE_TEXT || 'Агент вийшов в онлайн — перевіряємо чати 😎';
+
 const INTERCOM_VERSION = '2.14';
 const CUSTOM_ATTR_NAME = 'Unpaid Custom';
+const FOLLOW_UP_ATTR = 'Follow-Up';
 
-// Кешування для запобігання дублюванню нотаток в одному чаті під час сесії
+// === CACHE ===
 const processedSubscriptionConversations = new Set();
+const PRESALE_PROCESSED = new Map(); // convId -> date
+const lastAdminRun = new Map(); // adminId -> date
 
-// === ДОПОМІЖНІ ФУНКЦІЇ ===
-function log(tag, message, data = '') {
-    const timestamp = new Date().toISOString();
-    console.log(`[${timestamp}] [${tag}] ${message}`, data);
+// === LOG ===
+function log(tag, msg, data = '') {
+    console.log(`[${new Date().toISOString()}] [${tag}] ${msg}`, data || '');
 }
 
-// === ЛОГІКА 1 та 2: UNPAID ТА SUBSCRIPTION ===
-async function processClientData(item) {
-    const conversationId = item.id;
-    const contactId = item.contacts?.contacts[0]?.id || item.user?.id;
+// === HELPERS ===
+const normalize = e => e?.trim().toLowerCase();
 
+function isToday(unix) {
+    const d = new Date(unix * 1000);
+    const now = new Date();
+    return d.toDateString() === now.toDateString();
+}
+
+function canRunToday(adminId) {
+    const today = new Date().toISOString().split('T')[0];
+
+    if (lastAdminRun.get(adminId) === today) {
+        log('PRESALE-SKIP', `Админ ${adminId} уже запускал сегодня`);
+        return false;
+    }
+
+    lastAdminRun.set(adminId, today);
+    return true;
+}
+
+function canProcessConversationToday(convId) {
+    const today = new Date().toISOString().split('T')[0];
+
+    if (PRESALE_PROCESSED.get(convId) === today) {
+        log('PRESALE-SKIP', `Чат ${convId} уже обработан сегодня`);
+        return false;
+    }
+
+    PRESALE_PROCESSED.set(convId, today);
+    return true;
+}
+
+// === INTERCOM HELPERS ===
+async function getContact(contactId) {
+    return axios.get(`https://api.intercom.io/contacts/${contactId}`, {
+        headers: {
+            Authorization: `Bearer ${INTERCOM_TOKEN}`,
+            'Intercom-Version': INTERCOM_VERSION
+        }
+    });
+}
+
+async function updateContact(contactId, data) {
+    return axios.put(`https://api.intercom.io/contacts/${contactId}`, {
+        custom_attributes: data
+    }, {
+        headers: {
+            Authorization: `Bearer ${INTERCOM_TOKEN}`,
+            'Intercom-Version': INTERCOM_VERSION
+        }
+    });
+}
+
+async function addNote(conversationId, text) {
+    return axios.post(`https://api.intercom.io/conversations/${conversationId}/reply`, {
+        message_type: 'note',
+        admin_id: ADMIN_ID,
+        body: text
+    }, {
+        headers: {
+            Authorization: `Bearer ${INTERCOM_TOKEN}`,
+            'Intercom-Version': INTERCOM_VERSION
+        }
+    });
+}
+
+async function unsnooze(conversationId) {
+    return axios.post(`https://api.intercom.io/conversations/${conversationId}/reply`, {
+        message_type: 'open',
+        admin_id: ADMIN_ID
+    }, {
+        headers: {
+            Authorization: `Bearer ${INTERCOM_TOKEN}`,
+            'Intercom-Version': INTERCOM_VERSION
+        }
+    });
+}
+
+async function snooze(conversationId, seconds = 60) {
+    const until = Math.floor(Date.now() / 1000) + seconds;
+
+    return axios.post(`https://api.intercom.io/conversations/${conversationId}/snooze`, {
+        snoozed_until: until,
+        admin_id: ADMIN_ID
+    }, {
+        headers: {
+            Authorization: `Bearer ${INTERCOM_TOKEN}`,
+            'Intercom-Version': INTERCOM_VERSION
+        }
+    });
+}
+
+// === UNPAID + SUBSCRIPTION ===
+async function processClient(conversationId, contactId) {
     if (!contactId) {
-        log('SKIP', `Не знайдено ID клієнта в чаті ${conversationId}`);
+        log('SKIP', 'Нет contactId');
         return;
     }
 
     try {
-        log('FETCH', `Отримання даних клієнта ${contactId}...`);
-        const contactRes = await axios.get(`https://api.intercom.io/contacts/${contactId}`, {
-            headers: { 
-                'Authorization': `Bearer ${INTERCOM_TOKEN}`, 
-                'Accept': 'application/json', 
-                'Intercom-Version': INTERCOM_VERSION 
-            }
-        });
+        log('CONTACT', `Получаем контакт ${contactId}`);
 
-        const contact = contactRes.data;
+        const res = await getContact(contactId);
+        const contact = res.data;
+
         const email = contact.email;
         const purchaseEmail = contact.custom_attributes?.['Purchase Email'];
-        const subscription = contact.custom_attributes?.['subscription'];
+        const subscription = contact.custom_attributes?.['subscription'] || '';
 
-        // --- Логіка 1: Перевірка Unpaid ---
-        if (email || purchaseEmail) {
-            log('UNPAID-CHECK', `Перевірка списку для ${email || purchaseEmail}`);
-            const listRes = await axios.get(LIST_URL);
-            const unpaidList = listRes.data;
+        log('CONTACT-DATA', `Email: ${email}, Purchase: ${purchaseEmail}`);
 
-            const isUnpaid = (email && unpaidList.includes(email)) || 
-                             (purchaseEmail && unpaidList.includes(purchaseEmail));
+        // === UNPAID ===
+        if (LIST_URL && (email || purchaseEmail)) {
+            const { data: list } = await axios.get(LIST_URL);
 
-            if (isUnpaid) {
-                log('UNPAID-MATCH', `Клієнт у списку! Оновлюю атрибут ${CUSTOM_ATTR_NAME}...`);
-                await axios.put(`https://api.intercom.io/contacts/${contactId}`, 
-                    { custom_attributes: { [CUSTOM_ATTR_NAME]: true } },
-                    { headers: { 
-                        'Authorization': `Bearer ${INTERCOM_TOKEN}`, 
-                        'Content-Type': 'application/json', 
-                        'Intercom-Version': INTERCOM_VERSION 
-                    }
-                });
-                log('SUCCESS', `Атрибут Unpaid встановлено для ${contactId}`);
+            const normalizedList = list.map(normalize);
+
+            const isMatch =
+                (email && normalizedList.includes(normalize(email))) ||
+                (purchaseEmail && normalizedList.includes(normalize(purchaseEmail)));
+
+            if (isMatch) {
+                log('UNPAID', `Совпадение найдено`);
+
+                await updateContact(contactId, { [CUSTOM_ATTR_NAME]: true });
+
+                log('UNPAID', `Атрибут установлен`);
             }
         }
 
-        // --- Логіка 2: Перевірка поля Subscription ---
-        if (!subscription || subscription.trim() === '') {
+        // === SUBSCRIPTION ===
+        if (!subscription.trim()) {
             if (!processedSubscriptionConversations.has(conversationId)) {
-                log('SUBS-EMPTY', `Поле subscription порожнє в чаті ${conversationId}. Надсилаю нотатку...`);
-                
-                await axios.post(`https://api.intercom.io/conversations/${conversationId}/reply`, {
-                    message_type: 'note',
-                    type: 'admin',
-                    admin_id: ADMIN_ID,
-                    body: 'Please fill subscription 😇'
-                }, { 
-                    headers: { 
-                        'Authorization': `Bearer ${INTERCOM_TOKEN}`, 
-                        'Intercom-Version': INTERCOM_VERSION 
-                    } 
-                });
-                
+                log('SUBSCRIPTION', `Пустое поле → добавляем нот`);
+
+                await addNote(conversationId, 'Заповніть будь ласка subscription 😇🙏');
+
                 processedSubscriptionConversations.add(conversationId);
-                log('SUCCESS', `Нотатка про підписку додана в чат ${conversationId}`);
             }
         }
 
     } catch (err) {
-        log('ERROR', `Помилка обробки даних клієнта: ${err.message}`);
+        log('ERROR', err.message);
     }
 }
 
-// === ЛОГІКА 3: PRESALE TRIGGER (AWAY MODE) ===
-async function runPresaleCheck(adminId) {
-    log('PRESALE-START', `Запуск перевірки заснужених чатів для адміна ${adminId}...`);
-    let count = 0;
+// === PRESALE ===
+async function runPresale(adminId) {
+    if (!canRunToday(adminId)) return;
+
+    log('PRESALE', `Старт для админа ${adminId}`);
 
     try {
-        const startOfToday = new Date();
-        startOfToday.setHours(0, 0, 0, 0);
-        const startOfTodayUnix = Math.floor(startOfToday.getTime() / 1000);
-
-        // Шукаємо заснужені чати пресейл команди
-        const searchRes = await axios.post('https://api.intercom.io/conversations/search', {
+        const res = await axios.post(`https://api.intercom.io/conversations/search`, {
             query: {
                 operator: 'AND',
                 value: [
                     { field: 'state', operator: '=', value: 'snoozed' },
-                    { field: 'assignee_id', operator: '=', value: PRESALE_TEAM_ID }
+                    { field: 'team_assignee_id', operator: '=', value: PRESALE_TEAM_ID }
                 ]
             }
         }, {
-            headers: { 
-                'Authorization': `Bearer ${INTERCOM_TOKEN}`, 
-                'Intercom-Version': INTERCOM_VERSION, 
-                'Content-Type': 'application/json' 
+            headers: {
+                Authorization: `Bearer ${INTERCOM_TOKEN}`,
+                'Content-Type': 'application/json',
+                'Intercom-Version': INTERCOM_VERSION
             }
         });
 
-        const conversations = searchRes.data.conversations || [];
-        log('PRESALE-INFO', `Знайдено заснужених чатів: ${conversations.length}`);
+        const conversations = res.data.conversations || [];
+
+        log('PRESALE', `Найдено ${conversations.length}`);
 
         for (const conv of conversations) {
-            // Перевірка, чи чат не оновлювався сьогодні
-            if (conv.updated_at < startOfTodayUnix) {
-                log('PRESALE-ACTION', `Обробка чату ${conv.id} (останнє оновлення: ${conv.updated_at})`);
-                
-                await axios.post(`https://api.intercom.io/conversations/${conv.id}/reply`, {
-                    message_type: 'note',
-                    type: 'admin',
-                    admin_id: adminId,
-                    body: PRESALE_NOTE_TEXT
-                }, { 
-                    headers: { 
-                        'Authorization': `Bearer ${INTERCOM_TOKEN}`, 
-                        'Intercom-Version': INTERCOM_VERSION 
-                    } 
-                });
-                count++;
-            } else {
-                log('PRESALE-SKIP', `Чат ${conv.id} оновлювався сьогодні, пропускаємо.`);
+            log('CHECK', `Чат ${conv.id}`);
+
+            if (isToday(conv.updated_at)) {
+                log('SKIP', 'Обновлялся сегодня');
+                continue;
             }
+
+            if (!canProcessConversationToday(conv.id)) continue;
+
+            const full = await axios.get(`https://api.intercom.io/conversations/${conv.id}`, {
+                headers: {
+                    Authorization: `Bearer ${INTERCOM_TOKEN}`,
+                    'Intercom-Version': INTERCOM_VERSION
+                }
+            });
+
+            if (full.data.custom_attributes?.[FOLLOW_UP_ATTR]) {
+                log('SKIP', 'Есть Follow-Up');
+                continue;
+            }
+
+            log('ACTION', `Обрабатываем ${conv.id}`);
+
+            await unsnooze(conv.id);
+            await addNote(conv.id, PRESALE_NOTE_TEXT);
+            await snooze(conv.id, 60);
+
+            log('DONE', `Чат ${conv.id} обработан`);
         }
+
     } catch (err) {
-        log('PRESALE-ERROR', `Критична помилка пресейл-логіки: ${err.message}`);
+        log('PRESALE-ERROR', err.message);
     }
-    return count;
 }
 
-// === ГОЛОВНИЙ ОБРОБНИК WEBHOOK ===
+// === WEBHOOK ===
 app.post('/validate-email', async (req, res) => {
-    const body = req.body;
-    const topic = body.topic;
-    const item = body.data?.item;
+    const { topic, data } = req.body;
+    const item = data?.item;
 
-    if (!item) {
-        return res.status(200).json({ ok: true, status: 'no_data' });
+    if (!item) return res.status(200).json({ ok: true });
+
+    log('WEBHOOK', topic);
+
+    // === BOT → AGENT (SUBSCRIPTION + UNPAID)
+    if (topic === 'conversation.admin.assigned') {
+        const convId = item.id;
+        const contactId = item.contacts?.contacts?.[0]?.id;
+
+        if (item.previous_assignee?.type !== 'bot') {
+            log('SKIP', 'Не из бота');
+            return res.json({ ok: true });
+        }
+
+        log('TRANSFER', `Бот → агент | чат ${convId}`);
+
+        processClient(convId, contactId);
     }
 
-    log('WEBHOOK-RCV', `Отримано топік: ${topic}`);
-
-    // Трігер для Unpaid та Subscription
-    if (topic === 'conversation.user.created' || topic === 'conversation.user.replied') {
-        processClientData(item);
-    }
-
-    // Трігер для Presale (Away Mode)
+    // === PRESALE (AWAY OFF)
     if (topic === 'admin.away_mode_updated') {
-        const adminId = item.id; // Для цього топіку ID адміна знаходиться в item.id
+        const adminId = item.id;
         const isAway = item.away_mode_enabled;
 
-        log('STATUS-CHANGE', `Адмін ${adminId} змінив статус. Away Mode: ${isAway}`);
+        log('AWAY', `Admin ${adminId} | away: ${isAway}`);
 
-        if (isAway === false && adminId) {
-            const processedCount = await runPresaleCheck(adminId);
-            log('PRESALE-COMPLETE', `Перевірку закінчено. Оброблено чатів: ${processedCount}`);
+        if (isAway === false) {
+            runPresale(adminId);
         }
     }
 
     res.status(200).json({ ok: true });
 });
 
-// Підтримка HEAD запитів для перевірки Intercom
+// === HEAD ===
 app.head('/validate-email', (req, res) => res.status(200).end());
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log(`--- СЕРВЕР ЗАПУЩЕНО НА ПОРТУ ${PORT} ---`);
-    console.log(`Активні логіки: Unpaid, Subscription, Presale Check`);
+// === START ===
+app.listen(process.env.PORT || 3000, () => {
+    console.log('🚀 Server started');
 });
